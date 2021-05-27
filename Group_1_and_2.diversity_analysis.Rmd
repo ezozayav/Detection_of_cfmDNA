@@ -1,0 +1,1419 @@
+---
+title: "cfmDNA study: samples from group 1 and 2: diversity analysis. (Genome Biology revision 1)"
+author: "Enrique Zozaya-Valdés"
+date: "01/05/2021"
+output:
+  html_document:
+    toc: yes
+    number_sections: yes
+    toc_float: yes
+  html_notebook:
+    number_sections: yes
+    toc: yes
+    toc_float: yes
+    code_folding: "hide"
+urlcolor: blue
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r PackageLoad, tidy=TRUE, message=FALSE, warning=FALSE, echo=FALSE}
+library("tidyverse")
+library("reshape2")
+library("scales")
+library("metagenomeSeq")
+library("metagMisc")
+library("knitr")
+library("irr")
+library("Biostrings")
+library("ggpubr")
+library("vegan")
+library("ape")
+library("phyloseq")
+library("geepack")
+library(compositions)
+library(factoextra)
+```
+
+```{r FunctionsDec, message=FALSE, include=FALSE}
+# Function to remove OTUs with an abundance across all samples below a given threshold. This function was taken from: http://mixomics.org/mixmc/pre-processing/.
+# The function was modified to process a OTU (rows) x sample (columns) table.
+low.count.removal = function(
+  data, # OTU count data frame of size p (OTU) x n (sample); (rows x columns)
+  percent=0.01 # cutoff chosen
+){
+  OTU_percent_abund = rowSums(data)*100/(sum(rowSums(data)))
+  keep.otu = which(OTU_percent_abund > percent)
+  data.filter = data[keep.otu,]
+  return(list(data.filter = data.filter, OTU_percent_abund = OTU_percent_abund[keep.otu]))
+}
+
+## Function that changes QIIME2's Silva and Greengenes taxonomy output format to an RDP-like-fotmat
+format_silva_tax <- function(taxonomy_in){
+  taxonomy_out <- subset(taxonomy_in, select = Taxon)
+  taxonomy_out$Taxon <- str_replace_all(taxonomy_out$Taxon, "D_\\d+__", "")
+  taxonomy_out$Taxon <- str_replace_all(taxonomy_out$Taxon, "[\\w|[[:blank:]]|\\.]*(uncultured|unidentified)[\\w|[[:blank:]]|\\.]*", "")
+  taxonomy_out$Taxon <- str_replace_all(taxonomy_out$Taxon, ";Incertae Sedis;", ";;")
+  taxonomy_out <- separate(taxonomy_out, Taxon, c("Domain","Phylum","Class","Order","Family","Genus", "Species"), sep = ";")
+  taxonomy_out[taxonomy_out == ""] <- NA
+  missing_species <- which(is.na(taxonomy_out$Species))
+
+  for(i in seq_along(missing_species)){
+    deepest_assigned_pos <- sum(!is.na(taxonomy_out[missing_species[i],]))
+    deepest_assigned <- taxonomy_out[missing_species[i],deepest_assigned_pos]
+    missing_tax_lev <- is.na(taxonomy_out[missing_species[i],])
+    if(grepl("Unassigned", deepest_assigned)){
+      taxonomy_out[missing_species[i],missing_tax_lev] <- deepest_assigned
+    }else{
+      taxonomy_out[missing_species[i],missing_tax_lev] <- paste0(deepest_assigned, "_unclassified")
+    }
+  }
+  taxonomy_out
+}
+
+## Function to perform PERMANOVA analysis with repeat measure-aware permutations
+PERMANOVA_repeat_measures <- function(
+  D, permute_within, blocks = NULL, block_data, permutations=999,
+  metadata_order = c(names(permute_within), names(block_data)),
+  na.rm=F) {
+
+  # Make sure D is a dist object
+  if (class(D) != "dist") {
+    stop("D must be a dist object")
+  }
+
+  # Default to free permutations if blocks is not given
+  if (!missing(block_data) && is.null(blocks)) {
+    stop("blocks must be given if block_data is present")
+  } else if (is.null(blocks)) {
+    blocks <- rep(1, nrow(permute_within))
+    block_data <- as.data.frame(matrix(0, nrow=1, ncol=0))
+  } else if (length(unique(blocks)) == 1) {
+    warning("blocks only contains one unique value")
+  }
+
+  # Ensure no metadata overlap between permute_within and block_data
+  if (length(intersect(names(permute_within), names(block_data))) > 0) {
+    stop("metadata is repeated across permute_within and block_data")
+  }
+
+  # Ensure that metadata_order only contains stuff in permute_within and block_data
+  if(length(setdiff(metadata_order, union(names(permute_within), names(block_data)))) > 0) {
+    stop("metadata_order contains metadata not in permute_within and block_data")
+  }
+
+  # Ensure that the data in permute_within matches that in dist
+  ord <- rownames(as.matrix(D))
+  if (length(ord) != nrow(permute_within) || length(blocks) != length(ord)) {
+    stop("blocks, permute_within, and D are not the same size")
+  }
+  if (is.null(rownames(permute_within))) {
+    warning("permute_within has no rownames - can't verify sample orders")
+  } else if (!all(ord == rownames(permute_within))) {
+    stop("rownames do not match between permute_within and D")
+  }
+
+  # Ensure matching between blocks and block_data
+  if (any(is.na(blocks))) {
+    stop("NAs are not allowed in blocks")
+  }
+  if (is.factor(blocks)) {
+    if (length(levels(blocks)) != nrow(block_data)) {
+      stop("block_data does not have as many rows as blocks has levels")
+    }
+    if (!is.null(rownames(block_data)) && any(rownames(block_data) != levels(blocks))) {
+      stop("block_data rownames does not match the levels of blocks")
+    }
+    # Discard level information
+    blocks <- as.numeric(blocks)
+  } else if (is.numeric(blocks)) {
+    if (blocks < 1 || max(blocks) > nrow(block_data)) {
+      stop("Numeric blocks has indices out of range")
+    }
+  } else if (is.character(blocks)) {
+    if (is.null(rownames(block_data)) || !all(blocks %in% rownames(block_data))) {
+      stop("blocks does not match the rownames of block_data")
+    }
+    # Transform to numeric
+    blocks <- match(blocks, rownames(block_data))
+  } else {
+    stop("blocks must be a numeric, factor, or character vector")
+  }
+
+  # Error out on NA metadata rather than allowing adonis to error out with
+  # a totally nonsensical error message
+  if (any(is.na(permute_within)) || any(is.na(block_data))) {
+    if (na.rm) {
+      n_prerm <- length(blocks)
+
+      # Remove NAs in block_data
+      hasna <- (rowSums(is.na(block_data)) > 0) | (sapply(split(rowSums(is.na(permute_within)) > 0, blocks), mean) == 1)
+      block_data <- block_data[!hasna,, drop=F]
+      keep <- !hasna[blocks]
+      blocks <- cumsum(!hasna)[blocks]
+
+      blocks <- blocks[keep]
+      permute_within <- permute_within[keep,, drop=F]
+      D <- as.matrix(D)[keep, keep]
+      # block_data is not subset, as the rows with NAs are no longer referenced in blocks
+
+      # Remove NAs in permute_within
+      keep <- rowSums(is.na(permute_within)) == 0
+      blocks <- blocks[keep]
+      permute_within <- permute_within[keep,, drop=F]
+      D <- as.dist(D[keep, keep])
+
+      if (length(blocks) < ncol(permute_within) + ncol(block_data)) {
+        stop(sprintf("After omitting samples with NAs, the number of samples (%d) is less than the number of metadata (%d)",
+                     length(blocks), ncol(permute_within) + ncol(block_data)))
+      } else if (length(blocks) < n_prerm * 0.5) {
+        warning(sprintf("Removed %d samples with NA metadata", n_prerm - length(blocks)))
+      }
+    } else {
+      stop("Some metadata is NA! adonis does not support any NA in the metadata")
+    }
+  }
+
+  # Warn on some suspicious input
+  persample <- apply(permute_within, 1, function(x)is.factor(x) && !any(duplicated(x)))
+  if (any(persample)) {
+    warning(sprintf("%s in permute_within has one DOF per sample.", colnames(permute_within)[which(persample)[1]]))
+  }
+  if (length(unique(blocks)) < nrow(block_data)) {
+    warning("Not all blocks have a sample associated with them. Block permutations will still be performed over the full set of blocks - if this is not desired, subset block_data to only the blocks which appear in the data.")
+  }
+  if (!any(duplicated(blocks))) {
+    warning("blocks contains no duplicated elements")
+  }
+
+  library(vegan)
+  library(permute)
+
+  # Test statistic from non-permuted data
+  mtdat <- cbind(permute_within, block_data[blocks,,drop=F])
+  ad <- adonis(D ~ ., permutations=0, data=mtdat[, metadata_order, drop=F])
+  R2 <- ad$aov.tab$R2
+  names(R2) <- rownames(ad$aov.tab)
+
+  # Permutations
+  nullsamples <- matrix(NA, nrow=length(R2), ncol=permutations)
+  for (i in seq_len(permutations)) {
+    within.i <- shuffle(nrow(permute_within), control=how(blocks=blocks))
+    block.i <- sample(seq_len(nrow(block_data)))
+    mtdat <- cbind(
+      permute_within[within.i,,drop=F],
+      block_data[block.i,,drop=F][blocks,,drop=F])
+    perm.ad <- adonis(D ~ ., permutations=0, data=mtdat[, metadata_order, drop=F])
+
+    nullsamples[,i] <- perm.ad$aov.tab$R2
+  }
+
+  # For residuals, test the other direction (i.e. p-value of all covariates)
+  n <- length(R2)
+  R2[n-1] <- 1 - R2[n-1]
+  nullsamples[n-1,] <- 1 - nullsamples[n-1,]
+
+  # P value calculation similar to adonis's
+  exceedances <- rowSums(nullsamples > R2)
+  P <- (exceedances + 1) / (permutations + 1)
+
+  P[n] <- NA    # No p-values for "Total"
+  ad$aov.tab$`Pr(>F)` <- P
+
+  return (ad)
+}
+
+# Alexandra's color palette
+ARS_PerCol20 = c("#FF0000",  "#FF7200", "#FFAA00", "#FFDD00", "#72d813", "#154f0d", "#06993E", "#06D8C3", "#06B2D8", "#004ECC", "#0300cc", "#6200CC", "#8E00CC", "#C500CC", "#CC0073", "#CC002C", "#BA8857", "#A04620", "#F47A00", "#381C00")
+ARS_PerCol35 = c("#FF0000",  "#FF7200", "#FFAA00", "#FFDD00", "#72d813", "#154f0d", "#06993E", "#06D8C3", "#06B2D8", "#004ECC", "#0300cc", "#6200CC", "#8E00CC", "#C500CC", "#CC0073", "#CC002C", "#BA8857", "#A04620", "#F47A00", "#771155","#AA4488", "#CC99BB", "#114477", "#4477AA", "#77AADD", "#381C00", "#781156","#A51876","#D21E96","#E43FAD", "#117845","#18A55E","#1ED278","#3FE491","#6CEAAB")
+```
+
+#Data pre-processing
+
+```{r Import_and_basic_processing, echo=FALSE, message=FALSE, warning=FALSE, results='asis', tidy=TRUE}
+setwd("~/Documents/work/bioinformatics/experiments/16S_rRNA_gene/GB_revision1/R scripts for Github/Group 1 and 2/div_analysis")
+data_path <- "~/Documents/work/bioinformatics/experiments/16S_rRNA_gene/GB_revision1/R scripts for Github/Group 1 and 2/data/"
+
+load(paste0(data_path, "Group_1_and_2.data.RData"))
+
+#Alternative: Data import from individual data files
+# # Import biom file, phylogenetic tree and ASV sequences from QIIME2 
+# physeq2 <- import_biom(paste0(data_path, "Group_1_and_2.biom"), parseFunction = parse_taxonomy_default, refseqfilename = paste0(data_path, "Group_1_and_2.rep_seqs.align.fasta"), treefilename = paste0(data_path, "Group_1_and_2.rep_seqs.tre"))
+# # Read taxonomy file
+# taxonomy <- read.table(paste0(data_path, "Group_1_and_2.rep_seqs.silva_119_99_515_806.txt"), sep = "\t", row.names = 1, header = T)
+# # Create taxonomy phyloseq object
+# taxonomy_phy <- tax_table(as.matrix(taxonomy))
+# #Read metadata file
+# metadata <- read.table(paste0(data_path, "Group_1_and_2.metadata.txt"), sep = "\t", row.names = 1, header=TRUE)
+# # Create metadata phyloseq object
+# metadata_phy <- sample_data(metadata)
+# # Combine OTU table and taxonomy into a single phyloseq object
+# physeq2 <- merge_phyloseq(physeq2, taxonomy_phy, metadata_phy)
+
+#Remove Mock samples
+physeq2 <- subset_samples(physeq, sample_type != "Mock")
+physeq2 <- prune_taxa(taxa_sums(physeq2) > 0, physeq2)
+
+##### Removal of ASVs by taxonomy  ##### 
+cat('**Removal of ASVs that based on their taxonomic classification, do not form part of the microbial community:**\n\n')
+
+cat('Number of ASVs classified as Eukaryota at the Domain level: ')
+cat(sum(tax_table(physeq2)[,"Domain"] == "Eukaryota"), '\n\n')
+
+cat('Number of ASVs classified as mitochondria at the Family level: ')
+cat(sum(tax_table(physeq2)[,"Family"] == "mitochondria"), '\n\n')
+
+cat('Number of ASVs classified as Chloroplast at the Family level: ')
+cat(sum(tax_table(physeq2)[,"Class"] == "Chloroplast"), '\n\n')
+
+# Logical vector that indicates the ASVs which based on their taxonomic classification, we want to keep.
+# keep_taxa <- as.logical(!(tax_table(physeq2)[,"Domain"] == "Eukaryota" | tax_table(physeq2)[,"Domain"] == "Unassigned" | tax_table(physeq2)[,"Family"] == "mitochondria" | tax_table(physeq2)[,"Class"] == "Chloroplast"))
+
+##### TEST: code from "manus_div_analysis.v2.GB1.Rmd" 
+keep_taxa <- as.logical(!(tax_table(physeq2)[,"Domain"] == "Eukaryota" | tax_table(physeq2)[,"Family"] == "mitochondria" | tax_table(physeq2)[,"Class"] == "Chloroplast"))
+
+cat("Total number of ASVs to keep: ")
+cat(sum(keep_taxa), '\n\n') # Number of taxa to keep
+cat('***\n\n')
+# Removal of unwanted OTUs
+physeq2 <- prune_taxa(keep_taxa, physeq2)
+
+# Merge PCR replicates together (merge by biological sample)
+physeq2_bs <- merge_samples(physeq2, "biological_sample", fun = sum)
+# Because merge_samples swaps the rows and columns of the otu table, transpose it back
+otu_table(physeq2_bs) <- t(otu_table(physeq2_bs))
+# Re-assigning the refseq object
+physeq2_bs <- merge_phyloseq(physeq2_bs, refseq(physeq2))
+# Generate a new metadata table that matches the newly created merged OTU table
+metadata_phy_bs <- sample_data(prune_samples(!duplicated(get_variable(physeq2, "biological_sample")), physeq2))
+sample_names(metadata_phy_bs) <- metadata_phy_bs$biological_sample
+sample_data(physeq2_bs) <- metadata_phy_bs
+
+###### Filtering of OTU-tables based on OTU abundances #######
+
+#Because the microbiome composition can vary widely depending of the sample-type, the abundance-based filter was applied to each sample-type separately. Then the orginal OTU-table was subsetted to the set of OTUs that passed the filter for at least one sample-type.
+
+cat('**Filter of ASVs with an abundance across samples < 0.01% for each sample-type**\n\n')
+
+# Subset OTU table to plasma
+cat('Abundace-based filter of plasma samples:\n\n')
+physeq_bs_pl <- subset_samples(physeq2_bs, sample_type == "Plasma")
+physeq_bs_pl <- prune_taxa(taxa_sums(physeq_bs_pl) > 0, physeq_bs_pl)
+# Create new phyloseq OTU object by discarding OTUs with an abundance across all samples below 0.01%
+cat('* ASV abundance threshold in absolute numbers: ', sum(taxa_sums(physeq_bs_pl))*0.0001, '\n')
+physeq_bs_pl_sor <- physeq_bs_pl  # sor stands for "small OTU removal"
+df = low.count.removal(otu_table(physeq_bs_pl), percent=0.01)
+otu_table(physeq_bs_pl_sor) <- otu_table(df$data.filter)
+cat("* Number of ASVs that passed the filter: ", ntaxa(physeq_bs_pl_sor), '\n')
+cat("* Percentage of ASVs that passed the filter: ", (ntaxa(physeq_bs_pl_sor) / ntaxa(physeq_bs_pl)) * 100, '\n\n')
+
+# Subset OTU table to plasma-blank
+cat('Abundace-based filter of plasma-blank samples:\n\n')
+physeq_bs_plbl <- subset_samples(physeq2_bs, sample_type == "Plasma_ext_blank")
+physeq_bs_plbl <- prune_taxa(taxa_sums(physeq_bs_plbl) > 0, physeq_bs_plbl)
+# Create new phyloseq OTU object by discarding OTUs with an abundance across all samples below 0.01%
+cat("* ASV abundance threshold in absolute numbers:", sum(taxa_sums(physeq_bs_plbl))*0.0001, '\n')
+physeq_bs_plbl_sor <- physeq_bs_plbl  # sor stands for "small OTU removal"
+df = low.count.removal(otu_table(physeq_bs_plbl), percent=0.01)
+otu_table(physeq_bs_plbl_sor) <- otu_table(df$data.filter)
+cat("* Number of ASVs that passed the filter: ", ntaxa(physeq_bs_plbl_sor), '\n')
+cat("* Percentage of ASVs that passed the filter: ", (ntaxa(physeq_bs_plbl_sor) / ntaxa(physeq_bs_plbl)) * 100, '\n\n')
+
+# Subset OTU table to stool
+cat('Abundace-based filter of stool samples:\n\n')
+physeq_bs_st <- subset_samples(physeq2_bs, sample_type == "Stool")
+physeq_bs_st <- prune_taxa(taxa_sums(physeq_bs_st) > 0, physeq_bs_st)
+# Create new phyloseq OTU object by discarding OTUs with an abundance across all samples below 0.01%
+cat('* ASV abundance threshold in absolute numbers: ', sum(taxa_sums(physeq_bs_st))*0.0001, '\n')
+physeq_bs_st_sor <- physeq_bs_st  # sor stands for "small OTU removal"
+df = low.count.removal(otu_table(physeq_bs_st), percent=0.01)
+otu_table(physeq_bs_st_sor) <- otu_table(df$data.filter)
+cat('* Number of ASVs that passed the filter: ', ntaxa(physeq_bs_st_sor), '\n')
+cat('* Percentage of ASVs that passed the filter: ', (ntaxa(physeq_bs_st_sor) / ntaxa(physeq_bs_st)) * 100, '\n\n')
+
+# Subset OTU table to stool-blank
+cat('Abundace-based filter of stool-blank samples:\n\n')
+physeq_bs_stbl <- subset_samples(physeq2_bs, sample_type == "Stool_ext_blank")
+physeq_bs_stbl <- prune_taxa(taxa_sums(physeq_bs_stbl) > 0, physeq_bs_stbl)
+# Create new phyloseq OTU object by discarding OTUs with an abundance across all samples below 0.01%
+cat('* ASV abundance threshold in absolute numbers: ', sum(taxa_sums(physeq_bs_stbl))*0.0001, '\n')
+physeq_bs_stbl_sor <- physeq_bs_stbl  # sor stands for "small OTU removal"
+df = low.count.removal(otu_table(physeq_bs_stbl), percent=0.01)
+otu_table(physeq_bs_stbl_sor) <- otu_table(df$data.filter)
+cat('* Number of ASVs that passed the filter: ', ntaxa(physeq_bs_stbl_sor), '\n')
+cat('* Percentage of ASVs that passed the filter: ', (ntaxa(physeq_bs_stbl_sor) / ntaxa(physeq_bs_stbl)) * 100, '\n\n')
+
+# Subset OTU table to saliva
+cat('Abundace-based filter of saliva samples:\n\n')
+physeq_bs_sl <- subset_samples(physeq2_bs, sample_type == "Saliva")
+physeq_bs_sl <- prune_taxa(taxa_sums(physeq_bs_sl) > 0, physeq_bs_sl)
+# Create new phyloseq OTU object by discarding OTUs with an abundance across all samples below 0.01%
+cat('* ASV abundance threshold in absolute numbers: ', sum(taxa_sums(physeq_bs_sl))*0.0001, '\n')
+physeq_bs_sl_sor <- physeq_bs_sl  # sor stands for "small OTU removal"
+df = low.count.removal(otu_table(physeq_bs_sl), percent=0.01)
+otu_table(physeq_bs_sl_sor) <- otu_table(df$data.filter)
+cat('* Number of ASVs that passed the filter: ', ntaxa(physeq_bs_sl_sor), '\n')
+cat('* Percentage of ASVs that passed the filter: ', (ntaxa(physeq_bs_sl_sor) / ntaxa(physeq_bs_sl)) * 100, '\n\n')
+
+# Subset OTU table to saliva-blank
+cat('Abundace-based filter of saliva-blank samples:\n\n')
+physeq_bs_slbl <- subset_samples(physeq2_bs, sample_type == "Saliva_ext_blank")
+physeq_bs_slbl <- prune_taxa(taxa_sums(physeq_bs_slbl) > 0, physeq_bs_slbl)
+# Create new phyloseq OTU object by discarding OTUs with an abundance across all samples below 0.01%
+cat('* ASV abundance threshold in absolute numbers: ', sum(taxa_sums(physeq_bs_slbl))*0.0001, '\n')
+physeq_bs_slbl_sor <- physeq_bs_slbl  # sor stands for "small OTU removal"
+df = low.count.removal(otu_table(physeq_bs_slbl), percent=0.01)
+otu_table(physeq_bs_slbl_sor) <- otu_table(df$data.filter)
+cat('* Number of ASVs that passed the filter: ', ntaxa(physeq_bs_slbl_sor), '\n')
+cat('* Percentage of ASVs that passed the filter: ', (ntaxa(physeq_bs_slbl_sor) / ntaxa(physeq_bs_slbl)) * 100, '\n\n')
+
+# Subset OTU table to NTC
+cat('Abundace-based filter of NTCs:\n\n')
+physeq_bs_NTC <- subset_samples(physeq2_bs, sample_type == "NTC")
+physeq_bs_NTC <- prune_taxa(taxa_sums(physeq_bs_NTC) > 0, physeq_bs_NTC)
+# Create new phyloseq OTU object by discarding OTUs with an abundance across all samples below 0.01%
+cat('* ASV abundance threshold in absolute numbers: ', sum(taxa_sums(physeq_bs_NTC))*0.0001, '\n')
+physeq_bs_NTC_sor <- physeq_bs_NTC  # sor stands for "small OTU removal"
+df = low.count.removal(otu_table(physeq_bs_NTC), percent=0.01)
+otu_table(physeq_bs_NTC_sor) <- otu_table(df$data.filter)
+cat('* Number of ASVs that passed the filter: ', ntaxa(physeq_bs_NTC_sor), '\n')
+cat('* Percentage of ASVs that passed the filter: ', (ntaxa(physeq_bs_NTC_sor) / ntaxa(physeq_bs_NTC)) * 100, '\n\n')
+
+# Get the names of the OTUs that passed the low.count.removal filter for all the sample types (the union).
+sor_filtered_OTUs <- unique(c(taxa_names(physeq_bs_pl_sor), taxa_names(physeq_bs_plbl_sor), taxa_names(physeq_bs_st_sor), taxa_names(physeq_bs_stbl_sor), taxa_names(physeq_bs_sl_sor), taxa_names(physeq_bs_slbl_sor), taxa_names(physeq_bs_NTC_sor)))
+#Generate an OTU table that only contain the OTUs that passed the previous low.count.removal filters
+physeq2_bs_sor <- prune_taxa(sor_filtered_OTUs, physeq2_bs)
+
+cat('Abundance-based filter result for whole OTU-table:\n\n')
+cat('* Number of ASVs that passed the filter for whole OTU-table: ', ntaxa(physeq2_bs_sor), '\n')
+cat('* Percentage of ASVs that passed the filter for whole OTU-table: ', ntaxa(physeq2_bs_sor) / ntaxa(physeq2_bs) * 100, '\n\n')
+
+# Histogram of sample sizes:
+# sample_sizes <- as.data.frame(sample_sums(physeq2_bs_sor))
+# names(sample_sizes) <- "num_of_reads"
+# ggplot(sample_sizes, aes(x=num_of_reads)) + geom_histogram() + scale_x_continuous(breaks = pretty_breaks(n=20))
+# Sort all samples by size
+# as.data.frame(sort(sample_sums(physeq2_bs_sor)))
+# Sort saliva-blanks samples by size
+# as.data.frame(sort(sample_sums(physeq_bs_slbl_sor)))
+# NORMALIZE OTUs by rarefaction: 4 NTC and 3 saliva_ext_blank are removed
+physeq2_bs_sor_rf <- rarefy_even_depth(physeq2_bs_sor, rngseed = 711, replace=FALSE, trimOTUs = TRUE, sample.size = 128)
+
+###### OTU TABLE SUBSETS ######
+
+# OTU-TABLE SUBSET: plasma, blank and NTC
+physeq2_bs_sor_pl_bl_NTC <- subset_samples(physeq2_bs_sor, sample_type == "Plasma" | sample_type == "Plasma_ext_blank" | sample_type == "NTC")
+physeq2_bs_sor_pl_bl_NTC <- prune_taxa(taxa_sums(physeq2_bs_sor_pl_bl_NTC) > 0, physeq2_bs_sor_pl_bl_NTC)
+# Sort samples by total read number:
+# as.data.frame(sort(sample_sums(physeq2_bs_sor_pl_bl_NTC)))
+# NORMALIZE OTUs by rarefaction: picked the min sample size that corresponds to NTC_plate4_1. This allowed to keep 11 NTC samples (6 Nov18-NTCs and 5 Jul19-NTCs) without compomising too much the rest of the samples. 9 Nov18-NTCs and 3 Jul19-NTCs were removed.
+physeq2_bs_sor_pl_bl_NTC_rf <- rarefy_even_depth(physeq2_bs_sor_pl_bl_NTC, rngseed = 711, replace=FALSE, trimOTUs = TRUE, sample.size = 5306)
+
+# OTU-TABLE SUBSET: plasma, blank
+physeq2_bs_sor_pl_bl <- subset_samples(physeq2_bs_sor, sample_type == "Plasma" | sample_type == "Plasma_ext_blank")
+physeq2_bs_sor_pl_bl <- prune_taxa(taxa_sums(physeq2_bs_sor_pl_bl) > 0, physeq2_bs_sor_pl_bl)
+# Sort samples by total read number:
+# as.data.frame(sort(sample_sums(physeq2_bs_sor_pl_bl)))
+# NORMALIZE OTUs by rarefaction to min. sample size
+physeq2_bs_sor_pl_bl_rf <- rarefy_even_depth(physeq2_bs_sor_pl_bl, rngseed = 711, replace=FALSE, trimOTUs = TRUE)
+
+# OTU-TABLE SUBSET: all samples excepting Mock, Saliva and Saliva-blanks
+physeq2_bs_sor_subset2 <- subset_samples(physeq2_bs_sor, sample_type != "Saliva" & sample_type != "Saliva_ext_blank")
+physeq2_bs_sor_subset2 <- prune_taxa(taxa_sums(physeq2_bs_sor_subset2) > 0, physeq2_bs_sor_subset2)
+# Sort samples by total read number:
+# as.data.frame(sort(sample_sums(physeq2_bs_sor_subset2)))
+# NORMALIZE OTUs by rarefaction: picked the min sample size that corresponds to NTC_plate5_3 because this was the smallest sample with more than 1000 reads. This removes 6 Stool_ext_blanks and 7 NTCs
+physeq2_bs_sor_subset2_rf <- rarefy_even_depth(physeq2_bs_sor_subset2, rngseed = 711, replace=FALSE, trimOTUs = TRUE, sample.size = 1309)
+# OTU-TABLE SUBSET: all samples excepting Mock and blanks
+physeq2_bs_sor_subset3 <- subset_samples(physeq2_bs_sor, sample_type != "Saliva_ext_blank" & sample_type != "Plasma_ext_blank" & sample_type != "Stool_ext_blank" & sample_type != "NTC")
+physeq2_bs_sor_subset3 <- prune_taxa(taxa_sums(physeq2_bs_sor_subset3) > 0, physeq2_bs_sor_subset3)
+# Sort samples by total read number:
+# as.data.frame(sort(sample_sums(physeq2_bs_sor_subset3)))
+# NORMALIZE OTUs by rarefaction
+physeq2_bs_sor_subset3_rf <- rarefy_even_depth(physeq2_bs_sor_subset3, rngseed = 711, replace=FALSE, trimOTUs = TRUE)
+```
+
+#Sample sizes assessment
+
+```{r sample_sizes, echo=FALSE, results="hide", message=FALSE, fig.show="show",  warning=FALSE}
+system("mkdir sample_sizes")
+
+sample_sizes_w_metadata <- cbind(sample_data(physeq2_bs_sor), sample_size = sample_sums(physeq2_bs_sor))
+y <- dplyr::group_by(sample_sizes_w_metadata, sample_type)
+cat('Average number of reads per sample-type\n\n')
+dplyr::summarize(y, ave = mean(sample_size))
+
+## Plot with ggpubr: sample size (number of reads) per sample type: Supp. figure
+ggpubr_bx <- ggboxplot(sample_sizes_w_metadata, x="sample_type", y="sample_size", color="sample_type", 
+                       add ="mean",  size=1, width=0.5, 
+                       order=c("NTC","Saliva","Saliva_ext_blank","Stool","Stool_ext_blank","Plasma","Plasma_ext_blank"), 
+                       palette = c("light blue","#329E26","#7CCE73","#9E5524","#BC8F71","red", "#F78F8F"), xlab="sample type", 
+                       ylab="number of reads", legend="none", ggtheme = theme_bw()) 
+
+ggpubr_bx + scale_x_discrete(labels=c("NTC","saliva","saliva-DENC","stool","stool-DENC","plasma","plasma-DENC"))  + scale_y_continuous(breaks = pretty_breaks(n=6), labels=comma_format())  + theme(panel.grid.major.x = element_blank(), axis.text =element_text(size=11), axis.title = element_text(size=14), plot.title=element_text(size=10, face="bold"))  + ggtitle("Figure S2. Number of 16S rRNA gene quality-filtered reads obtained across sample types") 
+ggsave("./sample_sizes/Figure S2.pdf", width = 7, height = 4.5)
+```
+
+#Mock communities
+
+```{r Mock, echo=FALSE, results="hide", message=FALSE, fig.show="show",  warning=FALSE}
+system("mkdir mock")
+
+# Get a subset of the orginal OTU table that only contains the Mock samples
+physeq_Mock <- subset_samples(physeq, sample_type == "Mock")
+physeq_Mock <- prune_taxa(taxa_sums(physeq_Mock) > 0, physeq_Mock)
+
+# Create new phyloseq OTU object by discarding OTUs with an abundance across all samples below 0.01%
+physeq_Mock_sor <- physeq_Mock
+df = low.count.removal(otu_table(physeq_Mock), percent=0.01)
+otu_table(physeq_Mock_sor) <- otu_table(df$data.filter)
+
+# Rarified OTU table to the minimum sample size 
+#sort(sample_sums(physeq_Mock_sor)) #Get the sample sizes and sort them
+physeq_Mock_sor_rf <- rarefy_even_depth(physeq_Mock_sor, rngseed = 711, replace=FALSE, trimOTUs = TRUE, sample.size = 9593)
+#estimate_richness(physeq_Mock_sor_rf, measures = c("Observed"))
+
+# Rank-abundance plot
+total_taxa_abund <- sort(taxa_sums(physeq_Mock_sor_rf), TRUE, index.return=T)
+genera_sorted <- as.character(tax_table(physeq_Mock_sor_rf)[total_taxa_abund$ix,"Genus"])
+total_taxa_abund.df <- data.frame(OTU = names(total_taxa_abund$x), abundance = total_taxa_abund$x/nsamples(physeq_Mock_sor_rf))
+mock_rank_abund_plot <- ggplot(total_taxa_abund.df, aes(x = OTU, y = abundance)) + geom_bar(stat="identity") + scale_x_discrete(limits=names(total_taxa_abund$x), labels = genera_sorted) + theme(axis.text =element_text(size=10), axis.text.x = element_text(angle=45, hjust=1, vjust=1), plot.margin = unit(c(0.5,0.5,1,2.5),"cm"), axis.title = element_text(size=12),  plot.title=element_text(size=10, face="bold")) + xlab("ASV") + ggtitle("Figure S3 A. Taxonomic profile of a 20 strain evenly mixed\n mock community sequenced alongside study samples")
+mock_rank_abund_plot
+ggsave("./mock/Figure S3 A.pdf", width = 10, height = 6)
+
+# Bar plot of OTUs of Mock samples colored by genus
+physeq_Mock_sor_rf_top20 <- prune_taxa(names(total_taxa_abund$x[1:20]), physeq_Mock_sor_rf)
+plot_bar(physeq_Mock_sor_rf_top20, fill="Genus") + theme(axis.text.x = element_blank(), axis.text.y = element_text(size=12), axis.title = element_text(size=10, face="bold"), legend.text = element_text(size=10), plot.title=element_text(size=10, face="bold")) + scale_colour_manual(values=ARS_PerCol35) + scale_fill_manual(values=ARS_PerCol35) + ggtitle("Figure S3 B. Taxonomic profile of a 20 strain evenly mixed\n mock community sequenced alongside study samples")
+ggsave("./mock/Figure S3 B.pdf", width = 10, height = 5)
+```
+
+#Alpha diversity
+
+For ploting alpha-diversity measurments that included NTCs, the OTU-table was rarefied at a minimum sample size of 5,306 reads. This sample size allowed to keep 11 NTCs.
+
+```{r Alpha_div, echo=FALSE, results="hide", fig.show="show"}
+system("mkdir alpha_div")
+
+# ALPHA-DIVERISITY OF PLASMA, BLANKS AND NTC by "DNA ext batch" and "sample type"
+alpha_div_plot <- plot_richness(physeq2_bs_sor_pl_bl_NTC_rf, x = "plasma_ext_batch", measures=c("Observed", "InvSimpson"), color="sample_type")
+# Remove the geom_point layer from the ggplot object
+alpha_div_plot$layers <- alpha_div_plot$layers[-1]
+alpha_div_plot + geom_boxplot(data=alpha_div_plot$data, aes(color=sample_type), alpha=0.1, size=1) + ggtitle("Figure 3D. Community structure of cell free microbial DNA\n in plasma and patient-matching stool and saliva") + theme(axis.text = element_text(size=14), axis.text.x = element_text(angle = 0, hjust = 0.5), axis.title = element_text(size=14), plot.title = element_text(size=12), strip.text = element_text(face="bold", size=rel(1.2)), legend.title = element_text(size=14, face="bold"), legend.text = element_text(size=14)) + labs(color="sample type") + scale_color_manual(values=c("light blue","red", "#F78F8F"), labels = c("NTC","plasma","plasma-DENC")) + scale_x_discrete(breaks=c(c("A","B","C","D","E"), NA), labels = c("A","B","C","D","E","NTC")) + xlab("Extraction batch/NTC")
+ggsave("./alpha_div/Figure 3D.pdf", width = 8, height = 5)
+```
+
+Hypothesis test of alpha-diversity measurments based on generalized estimating equations (GEE). This allowed to control for repeated-measurments as in the patient-matching plasma samples of the DEBs A and B.
+
+```{r echo=FALSE, warning=FALSE}
+# Get alpha diversity estimates for every sample
+pl_bl_alpha_div <- estimate_richness(physeq2_bs_sor_pl_bl_NTC_rf, measures = c("Observed","Simpson"))
+pl_bl_alpha_div <- cbind(sample_data(physeq2_bs_sor_pl_bl_NTC_rf), pl_bl_alpha_div)
+pl_bl_alpha_div <- subset(pl_bl_alpha_div, sample_type %in% c("Plasma","Plasma_ext_blank"))
+pl_bl_alpha_div$sample_type <- droplevels(pl_bl_alpha_div$sample_type)
+
+### GEE test of interaction between sample_type and plasma_ext_batch ###
+
+data_test <- pl_bl_alpha_div
+#Assign the sample_id as biomarker_ID for blanks
+data_test$biomarker_ID <- as.character(data_test$biomarker_ID)
+data_test$biomarker_ID[data_test$sample_type == "Plasma_ext_blank"] <- as.character(data_test$biological_sample[data_test$sample_type == "Plasma_ext_blank"])
+data_test$biomarker_ID <- as.factor(data_test$biomarker_ID)
+
+#Number of OTUs by sample_type test across entire cohort 
+cat("Test of the difference between the richness of plasma vs DENCs across DEBs and of the interaction between sample-type and DEB\n\n")
+geeglm_test <- geeglm(Observed ~ plasma_ext_batch * sample_type, data = data_test, id=biomarker_ID, corstr="exchangeable", na.action=na.omit)
+anova(geeglm_test)
+#InvSimpson by sample_type test across entire cohort 
+cat("Test of the difference between the Simpson index of plasma vs DENCs across DEBs and of the interaction between sample-type and DEB\n\n")
+geeglm_test <- geeglm(Simpson ~ plasma_ext_batch * sample_type, data = data_test, id=biomarker_ID, corstr="exchangeable", na.action=na.omit)
+anova(geeglm_test)
+
+#Number of OTUs, Simpson and Shannon tests per DEB
+data_test.s <- split(data_test, data_test$plasma_ext_batch)
+geeglm.test.out <- sapply(data_test.s, function(x){
+  geeglm.test.out.all <- numeric()
+  geeglm.test.out <- geeglm(Observed ~ sample_type, data = x, id=biomarker_ID, corstr="exchangeable", na.action=na.omit)
+  geeglm.test.out.all[1] <- summary(geeglm.test.out)$coefficients[2,4]
+  geeglm.test.out <- geeglm(Simpson ~ sample_type, data = x, id=biomarker_ID, corstr="exchangeable", na.action=na.omit)
+  geeglm.test.out.all[2] <- summary(geeglm.test.out)$coefficients[2,4]
+  names(geeglm.test.out.all) <- c("Observed","Simpson")
+  geeglm.test.out.all
+})
+
+kable(geeglm.test.out, caption = "Geeglm test p-values for the comparisons of Plasma vs Plasma-blanks within each DNA extraction batch")
+```
+
+#Beta diversity
+
+##All sample types
+
+Non-metric Multidimensional Scaling (nMDS) of pairwise Bray-Curtis dissimilarities calculated from microbial community profiles for patient-matching plasma (batch A and B only), stool and saliva samples and respective DENCs at the ASV-level. For this analysis the OTU-table was rarefied and square-root transformed.
+
+```{r Beta_div_all_sample_types, echo=FALSE, results="hide", message=FALSE, fig.show="show", warning=FALSE}
+system("mkdir beta_div")
+# Set a publication ggplot theme for ordination plots
+pub_theme <- theme(axis.title = element_text(size=14), axis.text = element_text(size=14), plot.title = element_text(size=10), legend.title = element_text(size=14, face="bold"), legend.text = element_text(size=14))
+
+#Subset OTU table to Nov-18 samples
+physeq2_bs_sor_Nov18_rf <- subset_samples(physeq2_bs_sor_rf, seq_run == "Nov_2018")
+physeq2_bs_sor_Nov18_rf <- prune_taxa(taxa_sums(physeq2_bs_sor_Nov18_rf) > 0, physeq2_bs_sor_Nov18_rf)
+#### Data transformations
+physeq2_bs_sor_Nov18_rf_sqrt <- transform_sample_counts(physeq2_bs_sor_Nov18_rf, function(OTU) sqrt(OTU))
+#NMDS plot (Bray-Curtis) by sample type: sqrt transformed
+NMDS<-ordinate(physeq2_bs_sor_Nov18_rf_sqrt, method="NMDS", distance="bray")
+plot_NMDS<-plot_ordination(physeq2_bs_sor_Nov18_rf_sqrt, NMDS, type="samples", color="sample_type")
+plot_NMDS + geom_point(size = 2) + ggtitle(label ="Figure 3B. Community structure of cell free microbial DNA in \n plasma and patient-matching stool and saliva") + pub_theme + scale_color_manual(values=c("light blue","red", "#F78F8F","#329E26","#7CCE73","#9E5524","#BC8F71"), labels=c("NTC","plasma","plasma-DENC","saliva","saliva-DENC","stool","stool-DENC")) + labs(colour="sample type")
+ggsave("./beta_div/Figure 3B.pdf", width = 7, height = 5)
+```
+
+**PERMANOVA test of the overall effect of sample type (plasma, stool and saliva) on the community structure**
+
+Technical note: OTU table rarified to 12,049 reads was used. No data transformation was applied. Bray-Curtis dissimilarity used. 
+
+```{r RMAP_overall, echo=FALSE, warning=FALSE, message=FALSE}
+# Subset OTU table to Nov-2018 seq-run and sample types plasma, stool and saliva
+physeq2_bs_sor_Nov18_no_blanks <- subset_samples(physeq2_bs_sor, seq_run == "Nov_2018" &  sample_type %in% c("Plasma","Stool","Saliva"))
+physeq2_bs_sor_Nov18_no_blanks <- prune_taxa(taxa_sums(physeq2_bs_sor_Nov18_no_blanks) > 0, physeq2_bs_sor_Nov18_no_blanks)
+#Rarefy to even depth
+physeq2_bs_sor_Nov18_no_blanks_rf <- rarefy_even_depth(physeq2_bs_sor_Nov18_no_blanks, rngseed = 711, replace=FALSE, trimOTUs = TRUE)
+#Calculate Bray-Curtis dissimilarity
+BC_dist <- distance(physeq2_bs_sor_Nov18_no_blanks_rf, method="bray")
+Meta_df <- data.frame(sample_data(physeq2_bs_sor_Nov18_no_blanks_rf))
+```
+
+```{r RMAP, echo=FALSE}
+# Create "reapeted mesurment factor" for blocking data
+Meta_df$repeat_meas <- Meta_df$biomarker_ID
+#permute_within
+ST <- Meta_df$sample_type
+PW <- as.data.frame(ST)
+rownames(PW) <- rownames(Meta_df)
+#blocks
+BS <- as.vector(Meta_df$repeat_meas)
+#block_data
+Meta_subj <- Meta_df[order(Meta_df$repeat_meas),]
+Meta_subj <- Meta_subj[!duplicated(Meta_subj$repeat_meas),, drop=F]
+RM <- Meta_subj$repeat_meas
+Meta_sub <- as.data.frame(RM)
+rownames(Meta_sub) <- Meta_subj$repeat_meas
+```
+
+```{r RMAP_results, echo=FALSE}
+#Performing test
+RMAPres <- PERMANOVA_repeat_measures(
+    D = BC_dist, permutations=1000,
+    permute_within=PW,
+    blocks=BS, block_data=Meta_sub,
+    metadata_order = c(names(Meta_sub), names(PW)))
+RMAPres
+```
+
+**Repeated measurment aware PERMANOVA: Plasma vs Stool**
+
+```{r RMAP_pairwise1, echo=FALSE, warning=FALSE, message=FALSE}
+physeq_RMAP <- subset_samples(physeq2_bs_sor_Nov18_no_blanks_rf, sample_type == "Plasma" | sample_type == "Stool")
+physeq_RMAP <- prune_taxa(taxa_sums(physeq_RMAP) > 0, physeq_RMAP)
+# Normalize OTUs by rarefying at the minimum sample size.
+physeq_RMAP <- rarefy_even_depth(physeq_RMAP, rngseed = 711, replace=FALSE, trimOTUs = TRUE)
+BC_dist <- distance(physeq_RMAP, method="bray")
+# Metadata
+Meta_df <- data.frame(sample_data(physeq_RMAP))
+```
+
+```{r ref.label='RMAP', echo=FALSE}
+```
+
+```{r ref.label='RMAP_results', echo=FALSE}
+```
+
+**Repeated measurment aware PERMANOVA: Plasma vs Saliva**
+
+```{r RMAP_pairwise2, echo=FALSE, warning=FALSE, message=FALSE}
+physeq_RMAP <- subset_samples(physeq2_bs_sor_Nov18_no_blanks_rf, sample_type == "Plasma" | sample_type == "Saliva")
+physeq_RMAP <- prune_taxa(taxa_sums(physeq_RMAP) > 0, physeq_RMAP)
+# Normalize OTUs by rarefying at the minimum sample size.
+physeq_RMAP <- rarefy_even_depth(physeq_RMAP, rngseed = 711, replace=FALSE, trimOTUs = TRUE)
+BC_dist <- distance(physeq_RMAP, method="bray")
+# Metadata
+Meta_df <- data.frame(sample_data(physeq_RMAP))
+```
+
+```{r ref.label='RMAP', echo=FALSE}
+```
+
+```{r ref.label='RMAP_results', echo=FALSE}
+```
+
+**Repeated measurment aware PERMANOVA: Stool vs Saliva**
+
+```{r RMAP_pairwise3, echo=FALSE, warning=FALSE, message=FALSE}
+physeq_RMAP <- subset_samples(physeq2_bs_sor_Nov18_no_blanks_rf, sample_type == "Stool" | sample_type == "Saliva")
+physeq_RMAP <- prune_taxa(taxa_sums(physeq_RMAP) > 0, physeq_RMAP)
+# Normalize OTUs by rarefying at the minimum sample size.
+physeq_RMAP <- rarefy_even_depth(physeq_RMAP, rngseed = 711, replace=FALSE, trimOTUs = TRUE)
+BC_dist <- distance(physeq_RMAP, method="bray")
+# Metadata
+Meta_df <- data.frame(sample_data(physeq_RMAP))
+```
+
+```{r ref.label='RMAP', echo=FALSE}
+```
+
+```{r ref.label='RMAP_results', echo=FALSE}
+```
+
+**PERMANOVA: Stool vs Stool_ext_blank**
+
+```{r Adonis, echo=FALSE, warning=FALSE, message=FALSE}
+# Subset OTU table
+physeq2_bs_sor_st_bl <- subset_samples(physeq2_bs_sor, sample_type %in% c("Stool","Stool_ext_blank") )
+physeq2_bs_sor_st_bl <- prune_taxa(taxa_sums(physeq2_bs_sor_st_bl) > 0, physeq2_bs_sor_st_bl)
+# Normalize OTUs by rarefying at the minimum sample size.
+physeq2_bs_sor_st_bl_rf <- rarefy_even_depth(physeq2_bs_sor_st_bl, rngseed = 711, replace=FALSE, trimOTUs = TRUE)
+
+#Adonis test: sample_type controlled by ext_date
+metadata <- data.frame(sample_data(physeq2_bs_sor_st_bl_rf))
+BC_dist <- distance(physeq2_bs_sor_st_bl_rf, method="bray")
+adonis.out <- adonis(BC_dist ~ ext_date * sample_type, data=metadata)
+adonis.out
+```
+
+**PERMANOVA: Saliva vs Saliva_ext_blank**
+
+```{r Adonis2, echo=FALSE, warning=FALSE, message=FALSE}
+# Subset OTU table
+physeq2_bs_sor_sl_bl <- subset_samples(physeq2_bs_sor, sample_type %in% c("Saliva","Saliva_ext_blank") )
+physeq2_bs_sor_sl_bl <- prune_taxa(taxa_sums(physeq2_bs_sor_sl_bl) > 0, physeq2_bs_sor_sl_bl)
+# Normalize OTUs by rarefying at the minimum sample size.
+physeq2_bs_sor_sl_bl_rf <- rarefy_even_depth(physeq2_bs_sor_sl_bl, rngseed = 711, replace=FALSE, trimOTUs = TRUE, sample.size = 119)
+
+#Adonis test: sample_type controlled by ext_date
+metadata <- data.frame(sample_data(physeq2_bs_sor_sl_bl_rf))
+BC_dist <- distance(physeq2_bs_sor_sl_bl_rf, method="bray")
+adonis.out <- adonis(BC_dist ~ ext_date * sample_type, data=metadata)
+adonis.out
+```
+
+##Plasma and plasma_blanks across groups 1 and 2
+
+```{r Beta_div_plasma, echo=FALSE, results="hide", message=FALSE, fig.show="show",  warning=FALSE}
+#### ALL PLASMA AND PLASMA-BLANKS
+
+# Data transformations
+physeq2_bs_sor_pl_bl_rf_sqrt <- transform_sample_counts(physeq2_bs_sor_pl_bl_rf, function(OTU) sqrt(OTU))
+
+### Hierarchical clustering ###
+
+#UPGMA clustering plot
+BC_dist <- phyloseq::distance(physeq2_bs_sor_pl_bl_rf_sqrt, method="bray")
+BC_dist_hclust <- hclust(BC_dist, method="average")
+BC_dist_hclust.p <- as.phylo(BC_dist_hclust)
+write.tree(BC_dist_hclust.p, file="./beta_div/hclust_dendogram_for_Fig3C_and_FigS5.newick")
+
+#Same UPGMA clustering but using Aitchison distance
+data <- as.data.frame(t(otu_table(physeq2_bs_sor_pl_bl)))
+data.clr <- clr(data + 1)
+data.clr.dist <- dist(data.clr, method = "euclidean")
+data.clr.dist.hclust <- hclust(data.clr.dist, method="average")
+data.clr.dist.hclust.p <- as.phylo(data.clr.dist.hclust)
+write.tree(data.clr.dist.hclust.p, file="./beta_div/hclust_dendogram_for_FigS7.newick")
+```
+
+###Bray-Curtis based PERMANOVA
+
+**RMA-PERMANOVA test of the effect of DNA-ext-date (controlling by sample-type; with interaction)**
+
+```{r RMAP_overall2, echo=FALSE}
+BC_dist <- distance(physeq2_bs_sor_pl_bl_rf, method="bray")
+Meta_df <- data.frame(sample_data(physeq2_bs_sor_pl_bl_rf))
+```
+
+```{r RMAP2, echo=FALSE}
+# Create "reapeted mesurment factor" for blocking data
+Meta_df$repeat_meas <- as.character(Meta_df$biomarker_ID)
+Meta_df$repeat_meas[is.na(Meta_df$repeat_meas)] <- as.character(Meta_df$biological_sample[is.na(Meta_df$repeat_meas)])
+Meta_df$repeat_meas <- as.factor(Meta_df$repeat_meas)
+#permute_within
+ED <- Meta_df$ext_date
+PW <- as.data.frame(ED)
+rownames(PW) <- rownames(Meta_df)
+# INTERACTION FACTOR
+PW$ST_ED <- factor(paste(Meta_df$sample_type, PW$ED, sep = "."))
+#blocks
+BS <- as.vector(Meta_df$repeat_meas)
+#block_data
+Meta_subj <- Meta_df[order(Meta_df$repeat_meas),]
+Meta_subj <- Meta_subj[!duplicated(Meta_subj$repeat_meas),, drop=F]
+#RM <- Meta_subj$repeat_meas
+#Meta_sub <- as.data.frame(RM)
+ST <- Meta_subj$sample_type
+Meta_sub <- as.data.frame(ST)
+rownames(Meta_sub) <- Meta_subj$repeat_meas
+```
+
+```{r RMAP_results2, echo=FALSE}
+#Performing test
+RMAPres <- PERMANOVA_repeat_measures(
+    D = BC_dist, permutations=1000,
+    permute_within=PW,
+    blocks=BS, block_data=Meta_sub,
+    metadata_order = c(names(Meta_sub), names(PW)))
+RMAPres
+```
+
+**RMA-PERMANOVA test of the difference between plasma and plasma-blanks (controlling for DNA-ext-date; without interaction)**
+
+```{r RMAP3, echo=FALSE}
+# Create "reapeted mesurment factor" for blocking data
+Meta_df$repeat_meas <- as.character(Meta_df$biomarker_ID)
+Meta_df$repeat_meas[is.na(Meta_df$repeat_meas)] <- as.character(Meta_df$biological_sample[is.na(Meta_df$repeat_meas)])
+Meta_df$repeat_meas <- as.factor(Meta_df$repeat_meas)
+#permute_within
+ED <- Meta_df$ext_date
+PW <- as.data.frame(ED)
+rownames(PW) <- rownames(Meta_df)
+#blocks
+BS <- as.vector(Meta_df$repeat_meas)
+#block_data
+Meta_subj <- Meta_df[order(Meta_df$repeat_meas),]
+Meta_subj <- Meta_subj[!duplicated(Meta_subj$repeat_meas),, drop=F]
+#RM <- Meta_subj$repeat_meas
+#Meta_sub <- as.data.frame(RM)
+ST <- Meta_subj$sample_type
+Meta_sub <- as.data.frame(ST)
+rownames(Meta_sub) <- Meta_subj$repeat_meas
+```
+
+```{r RMAP_results3, echo=FALSE}
+RMAPres <- PERMANOVA_repeat_measures(
+    D = BC_dist, permutations=1000,
+    permute_within=PW,
+    blocks=BS, block_data=Meta_sub)
+RMAPres
+```
+
+**RMA-PERMANOVA test of the effect of DNA-extraction-batch (controlling for sample-type; with interaction)**
+
+```{r RMAP4, echo=FALSE}
+#permute_within
+DEB <- Meta_df$plasma_ext_batch
+PW <- as.data.frame(DEB)
+rownames(PW) <- rownames(Meta_df)
+# INTERACTION FACTOR
+PW$ST_DEB <- factor(paste(Meta_df$sample_type, PW$DEB, sep = "."))
+#blocks
+BS <- as.vector(Meta_df$repeat_meas)
+#block_data
+Meta_subj <- Meta_df[order(Meta_df$repeat_meas),]
+Meta_subj <- Meta_subj[!duplicated(Meta_subj$repeat_meas),, drop=F]
+#RM <- Meta_subj$repeat_meas
+#Meta_sub <- as.data.frame(RM)
+ST <- Meta_subj$sample_type
+Meta_sub <- as.data.frame(ST)
+rownames(Meta_sub) <- Meta_subj$repeat_meas
+```
+
+```{r RMAP_results4, echo=FALSE}
+#Performing test
+RMAPres <- PERMANOVA_repeat_measures(
+    D = BC_dist, permutations=1000,
+    permute_within=PW,
+    blocks=BS, block_data=Meta_sub,
+    metadata_order = c(names(Meta_sub), names(PW)))
+RMAPres
+```
+
+**RMA-PERMANOVA test of the difference between plasma and plasma-blanks (controlling for DNA-extraction-batch; with interaction)**
+
+```{r echo=FALSE}
+#Performing test
+RMAPres <- PERMANOVA_repeat_measures(
+    D = BC_dist, permutations=1000,
+    permute_within=PW,
+    blocks=BS, block_data=Meta_sub,
+    metadata_order = c("DEB","ST","ST_DEB"))
+RMAPres
+```
+
+**RMA-PERMANOVA test of the effect of sequencing-run (controlling for sample-type; with interaction) **
+
+```{r RMAP5, echo=FALSE}
+#permute_within
+SR <- Meta_df$seq_run
+PW <- as.data.frame(SR)
+rownames(PW) <- rownames(Meta_df)
+# INTERACTION FACTOR
+PW$ST_SR <- factor(paste(Meta_df$sample_type, PW$SR, sep = "."))
+#blocks
+BS <- as.vector(Meta_df$repeat_meas)
+#block_data
+Meta_subj <- Meta_df[order(Meta_df$repeat_meas),]
+Meta_subj <- Meta_subj[!duplicated(Meta_subj$repeat_meas),, drop=F]
+#RM <- Meta_subj$repeat_meas
+#Meta_sub <- as.data.frame(RM)
+ST <- Meta_subj$sample_type
+Meta_sub <- as.data.frame(ST)
+rownames(Meta_sub) <- Meta_subj$repeat_meas
+```
+
+```{r RMAP_results5, echo=FALSE}
+#Performing test
+RMAPres <- PERMANOVA_repeat_measures(
+    D = BC_dist, permutations=1000,
+    permute_within=PW,
+    blocks=BS, block_data=Meta_sub,
+    metadata_order = c(names(Meta_sub), names(PW)))
+RMAPres
+```
+
+**RMA-PERMANOVA test of the difference between plasma and plasma-blanks (controlling for DNA-extraction-batch; with interaction)**
+
+```{r echo=FALSE}
+#Performing test
+RMAPres <- PERMANOVA_repeat_measures(
+    D = BC_dist, permutations=1000,
+    permute_within=PW,
+    blocks=BS, block_data=Meta_sub,
+    metadata_order = c("SR","ST","ST_SR"))
+RMAPres
+```
+
+###Aitchison-distance based PERMANOVA
+
+**RMA-PERMANOVA test of the effect of DNA-ext-date (controlling by sample-type; with interaction)**
+
+```{r echo=FALSE}
+# Create "reapeted mesurment factor" for blocking data
+Meta_df$repeat_meas <- as.character(Meta_df$biomarker_ID)
+Meta_df$repeat_meas[is.na(Meta_df$repeat_meas)] <- as.character(Meta_df$biological_sample[is.na(Meta_df$repeat_meas)])
+Meta_df$repeat_meas <- as.factor(Meta_df$repeat_meas)
+#permute_within
+ED <- Meta_df$ext_date
+PW <- as.data.frame(ED)
+rownames(PW) <- rownames(Meta_df)
+# INTERACTION FACTOR
+PW$ST_ED <- factor(paste(Meta_df$sample_type, PW$ED, sep = "."))
+#blocks
+BS <- as.vector(Meta_df$repeat_meas)
+#block_data
+Meta_subj <- Meta_df[order(Meta_df$repeat_meas),]
+Meta_subj <- Meta_subj[!duplicated(Meta_subj$repeat_meas),, drop=F]
+#RM <- Meta_subj$repeat_meas
+#Meta_sub <- as.data.frame(RM)
+ST <- Meta_subj$sample_type
+Meta_sub <- as.data.frame(ST)
+rownames(Meta_sub) <- Meta_subj$repeat_meas
+```
+
+```{r echo=FALSE}
+#Performing test
+RMAPres <- PERMANOVA_repeat_measures(
+    D = data.clr.dist, permutations=1000,
+    permute_within=PW,
+    blocks=BS, block_data=Meta_sub,
+    metadata_order = c(names(Meta_sub), names(PW)))
+RMAPres
+
+```
+
+**RMA-PERMANOVA test of the difference between plasma and plasma-blanks (controlling for DNA-ext-date; without interaction)**
+
+```{r echo=FALSE}
+# Create "reapeted mesurment factor" for blocking data
+Meta_df$repeat_meas <- as.character(Meta_df$biomarker_ID)
+Meta_df$repeat_meas[is.na(Meta_df$repeat_meas)] <- as.character(Meta_df$biological_sample[is.na(Meta_df$repeat_meas)])
+Meta_df$repeat_meas <- as.factor(Meta_df$repeat_meas)
+#permute_within
+ED <- Meta_df$ext_date
+PW <- as.data.frame(ED)
+rownames(PW) <- rownames(Meta_df)
+#blocks
+BS <- as.vector(Meta_df$repeat_meas)
+#block_data
+Meta_subj <- Meta_df[order(Meta_df$repeat_meas),]
+Meta_subj <- Meta_subj[!duplicated(Meta_subj$repeat_meas),, drop=F]
+#RM <- Meta_subj$repeat_meas
+#Meta_sub <- as.data.frame(RM)
+ST <- Meta_subj$sample_type
+Meta_sub <- as.data.frame(ST)
+rownames(Meta_sub) <- Meta_subj$repeat_meas
+```
+
+```{r echo=FALSE}
+RMAPres <- PERMANOVA_repeat_measures(
+    D = data.clr.dist, permutations=1000,
+    permute_within=PW,
+    blocks=BS, block_data=Meta_sub)
+RMAPres
+```
+
+**RMA-PERMANOVA test of the effect of DNA-extraction-batch (controlling for sample-type; with interaction)**
+
+```{r echo=FALSE}
+#permute_within
+DEB <- Meta_df$plasma_ext_batch
+PW <- as.data.frame(DEB)
+rownames(PW) <- rownames(Meta_df)
+# INTERACTION FACTOR
+PW$ST_DEB <- factor(paste(Meta_df$sample_type, PW$DEB, sep = "."))
+#blocks
+BS <- as.vector(Meta_df$repeat_meas)
+#block_data
+Meta_subj <- Meta_df[order(Meta_df$repeat_meas),]
+Meta_subj <- Meta_subj[!duplicated(Meta_subj$repeat_meas),, drop=F]
+#RM <- Meta_subj$repeat_meas
+#Meta_sub <- as.data.frame(RM)
+ST <- Meta_subj$sample_type
+Meta_sub <- as.data.frame(ST)
+rownames(Meta_sub) <- Meta_subj$repeat_meas
+```
+
+```{r echo=FALSE}
+#Performing test
+RMAPres <- PERMANOVA_repeat_measures(
+    D = data.clr.dist, permutations=1000,
+    permute_within=PW,
+    blocks=BS, block_data=Meta_sub,
+    metadata_order = c(names(Meta_sub), names(PW)))
+RMAPres
+```
+
+**RMA-PERMANOVA test of the difference between plasma and plasma-blanks (controlling for DNA-extraction-batch; with interaction)**
+
+```{r echo=FALSE}
+#Performing test
+RMAPres <- PERMANOVA_repeat_measures(
+    D = data.clr.dist, permutations=1000,
+    permute_within=PW,
+    blocks=BS, block_data=Meta_sub,
+    metadata_order = c("DEB","ST","ST_DEB"))
+RMAPres
+```
+
+**RMA-PERMANOVA test of the effect of sequencing-run (controlling for sample-type; with interaction) **
+
+```{r echo=FALSE}
+#permute_within
+SR <- Meta_df$seq_run
+PW <- as.data.frame(SR)
+rownames(PW) <- rownames(Meta_df)
+# INTERACTION FACTOR
+PW$ST_SR <- factor(paste(Meta_df$sample_type, PW$SR, sep = "."))
+#blocks
+BS <- as.vector(Meta_df$repeat_meas)
+#block_data
+Meta_subj <- Meta_df[order(Meta_df$repeat_meas),]
+Meta_subj <- Meta_subj[!duplicated(Meta_subj$repeat_meas),, drop=F]
+#RM <- Meta_subj$repeat_meas
+#Meta_sub <- as.data.frame(RM)
+ST <- Meta_subj$sample_type
+Meta_sub <- as.data.frame(ST)
+rownames(Meta_sub) <- Meta_subj$repeat_meas
+```
+
+```{r echo=FALSE}
+#Performing test
+RMAPres <- PERMANOVA_repeat_measures(
+    D = data.clr.dist, permutations=1000,
+    permute_within=PW,
+    blocks=BS, block_data=Meta_sub,
+    metadata_order = c(names(Meta_sub), names(PW)))
+RMAPres
+```
+
+**RMA-PERMANOVA test of the difference between plasma and plasma-blanks (controlling for sequencing-run; with interaction)**
+
+```{r echo=FALSE}
+#Performing test
+RMAPres <- PERMANOVA_repeat_measures(
+    D = data.clr.dist, permutations=1000,
+    permute_within=PW,
+    blocks=BS, block_data=Meta_sub,
+    metadata_order = c("SR","ST","ST_SR"))
+RMAPres
+```
+
+#Taxonomy
+
+##Group 1
+
+```{r taxonomy, echo=FALSE, results="hide", message=FALSE, fig.show="show",  warning=FALSE, fig.height=9, fig.width=8}
+system("mkdir taxonomy")
+
+### NOV-18 DATA ### 
+
+#Create new factor by combining plasma_ext_batch with sample_type
+fact <- as.character(get_variable(physeq2_bs_sor_Nov18_rf, "plasma_ext_batch"))
+fact[is.na(fact)] <- ""
+sample_data(physeq2_bs_sor_Nov18_rf)$sample_type_batch <- as.factor(paste(get_variable(physeq2_bs_sor_Nov18_rf, "sample_type"), fact, sep = ""))
+
+#Merge samples by newly created factor by calculating the mean of the OTU abundances
+OTU_table_mean <- merge_samples(physeq2_bs_sor_Nov18_rf, "sample_type_batch", fun = mean)
+otu_table(OTU_table_mean) <- t(otu_table(OTU_table_mean)) # Because merge_samples swaps the rows and columns of the otu table, transpose it back
+# Generate a new metadata table that matches the newly created merged OTU table
+metadata_phy_new <- sample_data(prune_samples(!duplicated(get_variable(physeq2_bs_sor_Nov18_rf, "sample_type_batch")), physeq2_bs_sor_Nov18_rf))
+sample_names(metadata_phy_new) <- metadata_phy_new$sample_type_batch
+sample_data(OTU_table_mean) <- metadata_phy_new
+sample_names(OTU_table_mean) <- c("NTC","plasma-DENC batch A","plasma-DENC batch B","plasma batch A","plasma batch B","saliva","saliva-DENC","stool","stool-DENC")
+
+## Transform the OTU-table to relative percentage
+OTU_table_mean_perc <- transform_sample_counts(OTU_table_mean, function(OTU) 100 * OTU/sum(OTU))
+
+#Tax glom at the Phylum level
+OTU_table_mean_perc_phylum <- tax_glom(OTU_table_mean_perc, taxrank = "Phylum")
+taxa_names(OTU_table_mean_perc_phylum) <- tax_table(OTU_table_mean_perc_phylum)[,"Phylum"]
+# Pick top 20 Phyla
+TopPhyla <- names(sort(taxa_sums(OTU_table_mean_perc_phylum), TRUE)[1:15])
+OTU_table_mean_perc_phylum_top <- prune_taxa(TopPhyla, OTU_table_mean_perc_phylum)
+# Create taxa-bar-plot
+#sample_names(OTU_table_mean_perc_phylum_top) <- c("NTC","plasma-DENC batch A","plasma-DENC batch B","plasma batch A","plasma batch B","saliva","saliva-DENC","stool","stool-DENC")
+x_axis_order <- c("stool","stool-DENC","saliva","saliva-DENC","plasma batch A","plasma-DENC batch A","plasma batch B","plasma-DENC batch B","NTC")
+taxa_bar_plot <- plot_bar(OTU_table_mean_perc_phylum_top, fill = "Phylum") + scale_fill_manual(values=ARS_PerCol35) + scale_x_discrete(limits = x_axis_order) + ylab("Average abundance (%)") + xlab("Sample type")
+taxa_plot_aes <- theme(axis.text.x = element_text(size=12, angle = 45, hjust=1, vjust=1), axis.text.y = element_text(size=12), legend.title=element_text(size=14, face="bold"), legend.text = element_text(size=14), axis.title = element_text(size=14, face="bold"))
+taxa_bar_plot + taxa_plot_aes + ggtitle("Figure 3A. Taxonomic profiles of patient-matching plasma,\n stool and saliva samples and respective DENCs at the phylum level.")
+ggsave("./taxonomy/Figure3A.pdf", width = 8, height = 6)
+
+#Tax glom at the Class level
+OTU_table_mean_perc_Class <- tax_glom(OTU_table_mean_perc, taxrank = "Class")
+taxa_names(OTU_table_mean_perc_Class) <- tax_table(OTU_table_mean_perc_Class)[,"Class"]
+# Pick top 20 Phyla
+TopPhyla <- names(sort(taxa_sums(OTU_table_mean_perc_Class), TRUE)[1:15])
+OTU_table_mean_perc_Class_top <- prune_taxa(TopPhyla, OTU_table_mean_perc_Class)
+# Create taxa-bar-plot
+taxa_bar_plot <- plot_bar(OTU_table_mean_perc_Class_top, fill = "Class")+ scale_fill_manual(values=ARS_PerCol35) + scale_x_discrete(limits = x_axis_order) + ylab("Average abundance (%)") + xlab("Sample type")
+taxa_bar_plot + taxa_plot_aes + ggtitle("FigureS4A.Taxonomic profiles of patient-matching plasma,\n stool and saliva samples and respective DENCs")
+ggsave("./taxonomy/FigureS4A.pdf", width = 8, height = 6)
+
+#Tax glom at the Family level
+OTU_table_mean_perc_Family <- tax_glom(OTU_table_mean_perc, taxrank = "Family")
+#taxa_names(OTU_table_mean_perc_Family) <- tax_table(OTU_table_mean_perc_Family)[,"Family"]
+# Pick top 20 Phyla
+TopPhyla <- names(sort(taxa_sums(OTU_table_mean_perc_Family), TRUE)[1:20])
+OTU_table_mean_perc_Family_top <- prune_taxa(TopPhyla, OTU_table_mean_perc_Family)
+taxa_bar_plot <- plot_bar(OTU_table_mean_perc_Family_top, fill = "Family")+ scale_fill_manual(values=ARS_PerCol35) + scale_x_discrete(limits = x_axis_order) + ylab("Average abundance (%)") + xlab("Sample type")
+taxa_bar_plot + taxa_plot_aes + ggtitle("FigureS4B.Taxonomic profiles of patient-matching plasma, stool and saliva samples and respective DENCs.")
+ggsave("./taxonomy/FigureS4B.pdf", width = 8, height = 7)
+
+#Tax glom at the Genus level
+OTU_table_mean_perc_Genus <- tax_glom(OTU_table_mean_perc, taxrank = "Genus")
+#taxa_names(OTU_table_mean_perc_Genus) <- tax_table(OTU_table_mean_perc_Genus)[,"Genus"]
+# Pick top 20 Phyla
+TopPhyla <- names(sort(taxa_sums(OTU_table_mean_perc_Genus), TRUE)[1:20])
+OTU_table_mean_perc_Genus_top <- prune_taxa(TopPhyla, OTU_table_mean_perc_Genus)
+taxa_bar_plot <- plot_bar(OTU_table_mean_perc_Genus_top, fill = "Genus")+ scale_fill_manual(values=ARS_PerCol35) + scale_x_discrete(limits = x_axis_order) + ylab("Average abundance (%)") + xlab("Sample type")
+taxa_bar_plot + taxa_plot_aes + ggtitle("FigureS4C.Taxonomic profiles of patient-matching plasma, stool and saliva samples and respective DENCs.")
+ggsave("./taxonomy/FigureS4C.pdf", width = 8, height = 7)
+```
+
+##Group 2
+
+```{r echo=FALSE, results="hide", message=FALSE, fig.show="show",  warning=FALSE, fig.height=9, fig.width=8}
+### JUL-19 DATA ###
+
+#Subset OTU table to Jul-19 samples
+physeq2_bs_sor_Jul19 <- subset_samples(physeq2_bs_sor, seq_run == "Jul_2019")
+physeq2_bs_sor_Jul19 <- prune_taxa(taxa_sums(physeq2_bs_sor_Jul19) > 0, physeq2_bs_sor_Jul19)
+# Sort samples by total read number:
+as.data.frame(sort(sample_sums(physeq2_bs_sor_Jul19)))
+# NORMALIZE OTUs by rarefaction to min. sample size
+physeq2_bs_sor_Jul19_rf <- rarefy_even_depth(physeq2_bs_sor_Jul19, rngseed = 711, replace=FALSE, trimOTUs = TRUE, sample.size = 6042)
+
+#Create new factor by combining plasma_ext_batch with sample_type
+fact <- as.character(get_variable(physeq2_bs_sor_Jul19_rf, "plasma_ext_batch"))
+fact[is.na(fact)] <- ""
+sample_data(physeq2_bs_sor_Jul19_rf)$sample_type_batch <- as.factor(paste(get_variable(physeq2_bs_sor_Jul19_rf, "sample_type"), fact, sep = ""))
+
+#Merge samples by newly created factor by calculating the mean of the OTU abundances
+OTU_table_mean <- merge_samples(physeq2_bs_sor_Jul19_rf, "sample_type_batch", fun = mean)
+otu_table(OTU_table_mean) <- t(otu_table(OTU_table_mean)) # Because merge_samples swaps the rows and columns of the otu table, transpose it back
+# Generate a new metadata table that matches the newly created merged OTU table
+metadata_phy_new <- sample_data(prune_samples(!duplicated(get_variable(physeq2_bs_sor_Jul19_rf, "sample_type_batch")), physeq2_bs_sor_Jul19_rf))
+sample_names(metadata_phy_new) <- metadata_phy_new$sample_type_batch
+sample_data(OTU_table_mean) <- metadata_phy_new
+sample_names(OTU_table_mean) <- c("NTC","plasma-DENC batch C","plasma-DENC batch D","plasma-DENC batch E","plasma batch C","plasma batch D","plasma batch E")
+
+## Transform the OTU-table to relative percentage
+OTU_table_mean_perc <- transform_sample_counts(OTU_table_mean, function(OTU) 100 * OTU/sum(OTU))
+
+#Tax glom at the Phylum level
+OTU_table_mean_perc_phylum <- tax_glom(OTU_table_mean_perc, taxrank = "Phylum")
+taxa_names(OTU_table_mean_perc_phylum) <- tax_table(OTU_table_mean_perc_phylum)[,"Phylum"]
+# Pick top 20 Phyla
+TopPhyla <- names(sort(taxa_sums(OTU_table_mean_perc_phylum), TRUE)[1:15])
+OTU_table_mean_perc_phylum_top <- prune_taxa(TopPhyla, OTU_table_mean_perc_phylum)
+# Create taxa-bar-plot
+x_axis_order <- c("plasma batch C","plasma-DENC batch C","plasma batch D","plasma-DENC batch D","plasma batch E","plasma-DENC batch E","NTC") 
+taxa_bar_plot <- plot_bar(OTU_table_mean_perc_phylum_top, fill = "Phylum") + scale_fill_manual(values=ARS_PerCol35) + scale_x_discrete(limits = x_axis_order) + ylab("Average abundance (%)") + xlab("Sample type")
+taxa_bar_plot + taxa_plot_aes + ggtitle("FigureS6A.Taxonomic profile of plasma samples\n and their corresponding DENCs from DEBs C-E")
+ggsave("./taxonomy/FigureS6.pdf", width = 8, height = 6)
+
+#Tax glom at the Class level
+OTU_table_mean_perc_Class <- tax_glom(OTU_table_mean_perc, taxrank = "Class")
+taxa_names(OTU_table_mean_perc_Class) <- tax_table(OTU_table_mean_perc_Class)[,"Class"]
+# Pick top 20 Phyla
+TopPhyla <- names(sort(taxa_sums(OTU_table_mean_perc_Class), TRUE)[1:15])
+OTU_table_mean_perc_Class_top <- prune_taxa(TopPhyla, OTU_table_mean_perc_Class)
+# Create taxa-bar-plot
+taxa_bar_plot <- plot_bar(OTU_table_mean_perc_Class_top, fill = "Class") + scale_fill_manual(values=ARS_PerCol35) + scale_x_discrete(limits = x_axis_order) + ylab("Average abundance (%)") + xlab("Sample type")
+taxa_bar_plot + taxa_plot_aes + ggtitle("FigureS6B.Taxonomic profile of plasma samples\n and their corresponding DENCs from DEBs C-E")
+ggsave("./taxonomy/FigureS6B.pdf", width = 8, height = 6)
+
+#Tax glom at the Family level
+OTU_table_mean_perc_Family <- tax_glom(OTU_table_mean_perc, taxrank = "Family")
+#taxa_names(OTU_table_mean_perc_Family) <- tax_table(OTU_table_mean_perc_Family)[,"Family"]
+# Pick top 20 Phyla
+TopPhyla <- names(sort(taxa_sums(OTU_table_mean_perc_Family), TRUE)[1:20])
+OTU_table_mean_perc_Family_top <- prune_taxa(TopPhyla, OTU_table_mean_perc_Family)
+# Create taxa-bar-plot
+taxa_bar_plot <- plot_bar(OTU_table_mean_perc_Family_top, fill = "Family") + scale_fill_manual(values=ARS_PerCol35) + scale_x_discrete(limits = x_axis_order) + ylab("Average abundance (%)") + xlab("Sample type")
+taxa_bar_plot + taxa_plot_aes + ggtitle("FigureS6C.Taxonomic profile of plasma samples\n and their corresponding DENCs from DEBs C-E")
+ggsave("./taxonomy/FigureS6C.pdf", width = 8, height = 7)
+
+#Tax glom at the Genus level
+OTU_table_mean_perc_Genus <- tax_glom(OTU_table_mean_perc, taxrank = "Genus")
+#taxa_names(OTU_table_mean_perc_Genus) <- tax_table(OTU_table_mean_perc_Genus)[,"Genus"]
+# Pick top 20 Phyla
+TopPhyla <- names(sort(taxa_sums(OTU_table_mean_perc_Genus), TRUE)[1:20])
+OTU_table_mean_perc_Genus_top <- prune_taxa(TopPhyla, OTU_table_mean_perc_Genus)
+# Create taxa-bar-plot
+taxa_bar_plot <- plot_bar(OTU_table_mean_perc_Genus_top, fill = "Genus") + scale_fill_manual(values=ARS_PerCol35) + scale_x_discrete(limits = x_axis_order) + ylab("Average abundance (%)") + xlab("Sample type")
+taxa_bar_plot + taxa_plot_aes + ggtitle("FigureS6D.Taxonomic profile of plasma samples\n and their corresponding DENCs from DEBs C-E")
+ggsave("./taxonomy/FigureS6D.pdf", width = 8, height = 7)
+```
+
+#Comparisons between sample-types
+
+##Plasma_batch_A vs stool
+
+```{r corr_plasmaA_vs_stool_var_dec, include=FALSE}
+system("mkdir corr_sample_types")
+
+# Subset OTU table to samples of batch A
+physeq2_corr <- subset_samples(physeq2_bs_sor, plasma_ext_batch %in% c("A",NA) & sample_type %in% c("Plasma","Stool"))
+physeq2_corr <- prune_taxa(taxa_sums(physeq2_corr) > 0, physeq2_corr)
+
+# Normalize OTUs by rarefying at the minimum sample size.
+physeq2_corr <- rarefy_even_depth(physeq2_corr, rngseed = 711, replace=FALSE, trimOTUs = TRUE) # Rarify OTU table to the minimum sample size.
+
+sample_type1 <- "Plasma"
+sample_type2 <- "Stool"
+
+#contam_filters_results_column <- "plasmaA_vs_stool"
+```
+
+```{r corr_btwn_sample_types, echo=FALSE, message=FALSE, warning=FALSE, results="show"}
+# Get the metadata of sample_type1
+metadata_corr_sample_type1 <- subset(sample_data(physeq2_corr), sample_type == sample_type1)
+# Get the metadata of sample_type2
+metadata_corr_sample_type2 <- subset(sample_data(physeq2_corr), sample_type == sample_type2)
+
+# Get the "matching samples ID" of the sample_type1 samples
+matching_samples_sample_type1 <- levels(metadata_corr_sample_type1$matching_samples)
+# Get the "matching samples ID" of the sample_type2 samples
+matching_samples_sample_type2 <- levels(metadata_corr_sample_type2$matching_samples)
+# Get the "matching samples ID" shared between these two sets of sample_type1 and sample_type2 samples
+matching_samples_sample_type1_sample_type2 <- intersect(matching_samples_sample_type1, matching_samples_sample_type2)
+
+#Subset phyloseq object to matching sample_type1 and sample_type2 samples
+physeq2_corr_MS <- prune_samples(get_variable(physeq2_corr, "matching_samples") %in% matching_samples_sample_type1_sample_type2, physeq2_corr)
+
+# Extract OTU table of matching sample_type1 samples
+OTU_table_corr_st1 <- subset_samples(physeq2_corr_MS, sample_type == sample_type1)
+OTU_table_corr_st1.df <- otu_table(OTU_table_corr_st1)
+OTU_table_corr_st1.df.sort <- OTU_table_corr_st1.df[,order(get_variable(OTU_table_corr_st1, "matching_samples"))]
+OTU_table_corr_st1.df.sort.PA <- transform_sample_counts(OTU_table_corr_st1.df.sort, function(abund) 1*(abund>0)) # Transform extracted OTU table into presence/absence
+
+# Extract OTU table of matching sample_type2 samples
+OTU_table_corr_st2 <- subset_samples(physeq2_corr_MS, sample_type == sample_type2)
+OTU_table_corr_st2.df <- otu_table(OTU_table_corr_st2)
+OTU_table_corr_st2.df.sort <- OTU_table_corr_st2.df[,order(get_variable(OTU_table_corr_st2, "matching_samples"))]
+OTU_table_corr_st2.df.sort.PA <- transform_sample_counts(OTU_table_corr_st2.df.sort, function(abund) 1*(abund>0)) # Transform extracted OTU table into presence/absence
+
+# Get the names of the OTUs shared between sample-types per sample
+all_shared_OTUs_names <- list()
+for(i in 1:ncol(OTU_table_corr_st1.df.sort.PA)){
+  x <- OTU_table_corr_st1.df.sort.PA[,i] * OTU_table_corr_st2.df.sort.PA[,i]
+  all_shared_OTUs_names[[colnames(OTU_table_corr_st1.df.sort.PA[,i])]] <- as.character(rownames(x)[x==1])
+}
+
+# Get the OTU abundances in each "pair of compared sample-types" per sample
+all_shared_OTUs_abund <- all_shared_OTUs_names
+for(i in 1:length(all_shared_OTUs_names)){
+  if(length(all_shared_OTUs_names[[i]]) > 0){
+      sample <- colnames(OTU_table_corr_st1.df.sort[,i])
+      all_shared_OTUs_abund[[sample]] <- cbind(tax_table(physeq2_corr_MS)[all_shared_OTUs_names[[i]],"Genus"], as.data.frame(OTU_table_corr_st1.df.sort[all_shared_OTUs_names[[i]], i]), as.data.frame(OTU_table_corr_st2.df.sort[all_shared_OTUs_names[[i]], i]))
+  }
+}
+
+# Get the total number of shared OTUs per sample 
+all_shared_OTU_nums <- sapply(all_shared_OTUs_names, length)
+# Get sample_type 1 richness
+st1_richness <- estimate_richness(OTU_table_corr_st1, measures = "Observed")
+# Get the total number of reads of the "shared OTUs" per sample. NOTE: plasma has to be sample_type 1.
+all_shared_OTUs_reads <- sapply(all_shared_OTUs_abund, function(x){
+  if(length(x) > 0){
+    sum(x[,2])
+  }else{
+    length(x)  
+  }
+})
+# Get the total number of reads per sample
+st1_reads_per_sample <- sample_sums(OTU_table_corr_st1)
+
+# Create table with total number of sample_type_1 (plasma) OTUs, percentage of OTUs and percentage of reads
+all_shared_OTUs_table <- cbind(all_shared_OTU_nums,  100*all_shared_OTU_nums/st1_richness, 100*all_shared_OTUs_reads/st1_reads_per_sample)
+names(all_shared_OTUs_table) <- c("num_of_OTUs","perc_of_OTUs","perc_of_reads")
+all_shared_OTUs_table <- round(all_shared_OTUs_table, digits=1)
+kable(all_shared_OTUs_table, caption = "Total number of plasma OTUs shared between matching samples")
+```
+
+```{r include=FALSE}
+all_shared_OTUs_table.plA_vs_st <- all_shared_OTUs_table
+all_shared_OTUs_names.plA_vs_st <- all_shared_OTUs_names
+all_shared_OTUs_abund.plA_vs_st <- all_shared_OTUs_abund
+plA_mtch_samples_richness <- st1_richness
+plA_mtch_samples_reads <- st1_reads_per_sample
+```
+
+##Plasma_batch_B vs stool correlation
+
+```{r corr_plasmaB_vs_stool_var_dec, include=FALSE}
+# Subset OTU table to samples of batch A
+physeq2_corr <- subset_samples(physeq2_bs_sor, plasma_ext_batch %in% c("B",NA) & sample_type %in% c("Plasma","Stool"))
+physeq2_corr <- prune_taxa(taxa_sums(physeq2_corr) > 0, physeq2_corr)
+
+# Normalize OTUs by rarefying at the minimum sample size.
+physeq2_corr <- rarefy_even_depth(physeq2_corr, rngseed = 711, replace=FALSE, trimOTUs = TRUE) # Rarify OTU table to the minimum sample size.
+
+sample_type1 <- "Plasma"
+sample_type2 <- "Stool"
+
+#contam_filters_results_column <- "plasmaB_vs_stool"
+```
+
+```{r ref.label='corr_btwn_sample_types', echo=FALSE}
+```
+
+```{r include=FALSE}
+all_shared_OTUs_table.plB_vs_st <- all_shared_OTUs_table
+all_shared_OTUs_names.plB_vs_st <- all_shared_OTUs_names
+all_shared_OTUs_abund.plB_vs_st <- all_shared_OTUs_abund
+plB_mtch_samples_richness <- st1_richness
+plB_mtch_samples_reads <- st1_reads_per_sample
+```
+
+##Plasma_batch_A vs saliva correlation
+
+```{r corr_plasmaA_vs_saliva_var_dec, include=FALSE}
+# Subset OTU table to samples of batch A
+physeq2_corr <- subset_samples(physeq2_bs_sor, plasma_ext_batch %in% c("A",NA) & sample_type %in% c("Plasma","Saliva"))
+physeq2_corr <- prune_taxa(taxa_sums(physeq2_corr) > 0, physeq2_corr)
+
+# Normalize OTUs by rarefying at the minimum sample size.
+physeq2_corr <- rarefy_even_depth(physeq2_corr, rngseed = 711, replace=FALSE, trimOTUs = TRUE) # Rarify OTU table to the minimum sample size.
+
+sample_type1 <- "Plasma"
+sample_type2 <- "Saliva"
+
+#contam_filters_results_column <- "plasmaA_vs_saliva"
+```
+
+```{r ref.label='corr_btwn_sample_types', echo=FALSE}
+```
+
+```{r include=FALSE}
+all_shared_OTUs_table.plA_vs_sl <- all_shared_OTUs_table
+all_shared_OTUs_names.plA_vs_sl <- all_shared_OTUs_names
+all_shared_OTUs_abund.plA_vs_sl <- all_shared_OTUs_abund
+plA_mtch_samples_richness <- st1_richness
+plA_mtch_samples_reads <- st1_reads_per_sample
+```
+
+##Plasma_batch_B vs saliva correlation
+
+```{r corr_plasmaB_vs_saliva_var_dec, include=FALSE}
+# Subset OTU table to samples of batch B
+physeq2_corr <- subset_samples(physeq2_bs_sor, plasma_ext_batch %in% c("B",NA) & sample_type %in% c("Plasma","Saliva"))
+physeq2_corr <- prune_taxa(taxa_sums(physeq2_corr) > 0, physeq2_corr)
+
+# Normalize OTUs by rarefying at the minimum sample size.
+physeq2_corr <- rarefy_even_depth(physeq2_corr, rngseed = 711, replace=FALSE, trimOTUs = TRUE) # Rarify OTU table to the minimum sample size.
+
+sample_type1 <- "Plasma"
+sample_type2 <- "Saliva"
+
+corr_plot_file <- "./corr_sample_types/plasmaB_vs_saliva_corr_Rho0.2.pdf"
+contam_filters_results_column <- "plasmaB_vs_saliva"
+```
+
+```{r ref.label='corr_btwn_sample_types', echo=FALSE}
+```
+
+```{r include=FALSE}
+all_shared_OTUs_table.plB_vs_sl <- all_shared_OTUs_table
+all_shared_OTUs_names.plB_vs_sl <- all_shared_OTUs_names
+all_shared_OTUs_abund.plB_vs_sl <- all_shared_OTUs_abund
+plB_mtch_samples_richness <- st1_richness
+plB_mtch_samples_reads <- st1_reads_per_sample
+```
+
+##DEB_A and DEB_B average
+
+```{r Average_OTUs_shared_pl_st, echo=FALSE}
+# Edits of all_shared_OTUs_table.plA_vs_st
+# Add the table's rownames as a column and add the "matching samples" IDs as table-names
+all_shared_OTUs_table.plA_vs_st <- cbind(biological_sample = rownames(all_shared_OTUs_table.plA_vs_st), all_shared_OTUs_table.plA_vs_st)
+matching_samples <- sample_data(physeq2_bs_sor)[row.names(all_shared_OTUs_table.plA_vs_st),"matching_samples"]
+matching_samples <- as.character(matching_samples$matching_samples)
+rownames(all_shared_OTUs_table.plA_vs_st) <- matching_samples
+
+# Edits of all_shared_OTUs_table.plB_vs_st
+# Add the table's rownames as a column and add the "matching samples" IDs as table-names
+all_shared_OTUs_table.plB_vs_st <- cbind(biological_sample = rownames(all_shared_OTUs_table.plB_vs_st), all_shared_OTUs_table.plB_vs_st)
+matching_samples <- sample_data(physeq2_bs_sor)[row.names(all_shared_OTUs_table.plB_vs_st),"matching_samples"]
+matching_samples <- as.character(matching_samples$matching_samples)
+rownames(all_shared_OTUs_table.plB_vs_st) <- matching_samples
+
+# Create a version of all_shared_OTUs_table.plB_vs_st in which the samples present in DEB A but not in B, get inserted. This for the later calculation of the average of the columns of all_shared_OTUs_table.plA_vs_st and all_shared_OTUs_table.plB_vs_st. In this way, when a samples is only present in DEB A, the average with result in the original DEB A value.
+all_shared_OTUs_table.plB_vs_st.m <- all_shared_OTUs_table.plA_vs_st
+all_shared_OTUs_table.plB_vs_st.m[rownames(all_shared_OTUs_table.plB_vs_st),2:4] <- all_shared_OTUs_table.plB_vs_st[,2:4]
+
+# Table with the average number of OTUs shared between plasma and stool in DEB A and B
+all_sh_OTUs_tbl.plA_B_vs_st <- cbind(rowMeans(cbind(all_shared_OTUs_table.plA_vs_st$num_of_OTUs, all_shared_OTUs_table.plB_vs_st.m$num_of_OTUs)), rowMeans(cbind(all_shared_OTUs_table.plA_vs_st$perc_of_OTUs, all_shared_OTUs_table.plB_vs_st.m$perc_of_OTUs)), rowMeans(cbind(all_shared_OTUs_table.plA_vs_st$perc_of_reads, all_shared_OTUs_table.plB_vs_st.m$perc_of_reads)))
+colnames(all_sh_OTUs_tbl.plA_B_vs_st) <- colnames(all_shared_OTUs_table.plA_vs_st)[-1]
+rownames(all_sh_OTUs_tbl.plA_B_vs_st) <- rownames(all_shared_OTUs_table.plA_vs_st)
+
+kable(all_sh_OTUs_tbl.plA_B_vs_st, caption = "Average number of OTUs and reads shared between plasma and stool in DEB A and B. Info for Table S2.")
+```
+
+```{r Average_OTUs_shared_pl_sl, echo=FALSE}
+# Edits of all_shared_OTUs_table.plA_vs_sl
+# Add the table's rownames as a column and add the "matching samples" IDs as table-names
+all_shared_OTUs_table.plA_vs_sl <- cbind(biological_sample = rownames(all_shared_OTUs_table.plA_vs_sl), all_shared_OTUs_table.plA_vs_sl)
+matching_samples <- sample_data(physeq2_bs_sor)[row.names(all_shared_OTUs_table.plA_vs_sl),"matching_samples"]
+matching_samples <- as.character(matching_samples$matching_samples)
+rownames(all_shared_OTUs_table.plA_vs_sl) <- matching_samples
+
+# Edits of all_shared_OTUs_table.plB_vs_sl
+# Add the table's rownames as a column and add the "matching samples" IDs as table-names
+all_shared_OTUs_table.plB_vs_sl <- cbind(biological_sample = rownames(all_shared_OTUs_table.plB_vs_sl), all_shared_OTUs_table.plB_vs_sl)
+matching_samples <- sample_data(physeq2_bs_sor)[row.names(all_shared_OTUs_table.plB_vs_sl),"matching_samples"]
+matching_samples <- as.character(matching_samples$matching_samples)
+rownames(all_shared_OTUs_table.plB_vs_sl) <- matching_samples
+
+# Create a version of all_shared_OTUs_table.plB_vs_sl in which the samples present in DEB A but not in B, get inserted. This for the later calculation of the average of the columns of all_shared_OTUs_table.plA_vs_sl and all_shared_OTUs_table.plB_vs_sl. In this way, when a samples is only present in DEB A, the average with result in the original DEB A value.
+all_shared_OTUs_table.plB_vs_sl.m <- all_shared_OTUs_table.plA_vs_sl
+all_shared_OTUs_table.plB_vs_sl.m[rownames(all_shared_OTUs_table.plB_vs_sl),2:4] <- all_shared_OTUs_table.plB_vs_sl[,2:4]
+
+# Table with the average number of OTUs shared between plasma and saliva in DEB A and B
+all_sh_OTUs_tbl.plA_B_vs_sl <- cbind(rowMeans(cbind(all_shared_OTUs_table.plA_vs_sl$num_of_OTUs, all_shared_OTUs_table.plB_vs_sl.m$num_of_OTUs)), rowMeans(cbind(all_shared_OTUs_table.plA_vs_sl$perc_of_OTUs, all_shared_OTUs_table.plB_vs_sl.m$perc_of_OTUs)), rowMeans(cbind(all_shared_OTUs_table.plA_vs_sl$perc_of_reads, all_shared_OTUs_table.plB_vs_sl.m$perc_of_reads)))
+colnames(all_sh_OTUs_tbl.plA_B_vs_sl) <- colnames(all_shared_OTUs_table.plA_vs_sl)[-1]
+rownames(all_sh_OTUs_tbl.plA_B_vs_sl) <- rownames(all_shared_OTUs_table.plA_vs_sl)
+
+kable(all_sh_OTUs_tbl.plA_B_vs_sl, caption = "Average number of OTUs and reads shared between plasma and saliva in DEB A and B. Info for Table S2.")
+```
+
+```{r include=FALSE}
+save.image("/Users/zozaya-valdesenrique/Documents/work/bioinformatics/experiments/16S_rRNA_gene/GB_revision1/R scripts for Github/Group 1 and 2/div_analysis/Group_1_and_2.diversity_analysis.RData")
+save(physeq2_bs, physeq2_bs_sor, physeq2_bs_sor_pl_bl, file = "/Users/zozaya-valdesenrique/Documents/work/bioinformatics/experiments/16S_rRNA_gene/GB_revision1/R scripts for Github/Group 1 and 2/div_analysis/Group_1_and_2.OTU_tables.RData")
+```
