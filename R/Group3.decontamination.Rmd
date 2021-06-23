@@ -1,0 +1,694 @@
+---
+title: "cfmDNA study: samples from group 3: decontamination analysis."
+author: "Enrique Zozaya"
+date: "01/05/2021"
+output:
+  html_document:
+    toc: yes
+    number_sections: yes
+    toc_float: yes
+  html_notebook:
+    number_sections: yes
+    toc: yes
+    toc_float: yes
+    code_folding: "hide"
+urlcolor: blue
+---
+
+```{r PackageLoad, tidy=TRUE, message=FALSE, warning=FALSE, echo=FALSE}
+library("phyloseq")
+library("ggplot2")
+library("reshape2")
+library("scales")
+library("decontam")
+library("tidyr")
+library("metagenomeSeq")
+library("metagMisc")
+library("stringr")
+library("edgeR")
+library("limma")
+library("knitr")
+library("irr")
+library("vegan")
+library("dplyr")
+library("Biostrings")
+library("compositions")
+library(factoextra)
+```
+
+```{r FunctionsDec, echo=FALSE, message=FALSE}
+# Function to remove OTUs with an abundance across all samples below a given threshold. This function was taken from: http://mixomics.org/mixmc/pre-processing/.
+# The function was modified to process a OTU (rows) x sample (columns) table.
+low.count.removal = function(
+  data, # OTU count data frame of size p (OTU) x n (sample); (rows x columns)
+  percent=0.01 # cutoff chosen
+){
+  OTU_percent_abund = rowSums(data)*100/(sum(rowSums(data)))
+  keep.otu = which(OTU_percent_abund > percent)
+  data.filter = data[keep.otu,]
+  return(list(data.filter = data.filter, OTU_percent_abund = OTU_percent_abund[keep.otu]))
+}
+
+# Modification of the low.count.removal function that filters based on a range of abundances
+abund.range.filter = function(
+  data, # OTU count data frame of size p (OTU) x n (sample); (rows x columns)
+  min_percent=0.01,
+  max_percent=100
+){
+  OTU_percent_abund = rowSums(data)*100/(sum(rowSums(data)))
+  keep.otu = which(OTU_percent_abund > min_percent & OTU_percent_abund < max_percent)
+  data.filter = data[keep.otu,]
+  return(list(data.filter = data.filter, OTU_percent_abund = OTU_percent_abund[keep.otu]))
+}
+
+## Function to remove samples using phyloseq
+pop_samples <- function(physeq, badSample){
+  allSample <- sample_names(physeq)
+  allSample <- allSample[!(allSample %in% badSample)]
+  return(prune_samples(allSample, physeq))
+}
+
+## Function that changes QIIME2's Silva and Greengenes taxonomy output format to an RDP-like-fotmat
+format_silva_tax <- function(taxonomy_in){
+  taxonomy_out <- subset(taxonomy_in, select = Taxon)
+  taxonomy_out$Taxon <- str_replace_all(taxonomy_out$Taxon, "D_\\d+__", "")
+  taxonomy_out$Taxon <- str_replace_all(taxonomy_out$Taxon, "[\\w|[[:blank:]]|\\.]*(uncultured|unidentified)[\\w|[[:blank:]]|\\.]*", "")
+  taxonomy_out$Taxon <- str_replace_all(taxonomy_out$Taxon, ";Incertae Sedis;", ";;")
+  taxonomy_out <- separate(taxonomy_out, Taxon, c("Domain","Phylum","Class","Order","Family","Genus", "Species"), sep = ";")
+  taxonomy_out[taxonomy_out == ""] <- NA
+  missing_species <- which(is.na(taxonomy_out$Species))
+
+  for(i in seq_along(missing_species)){
+    deepest_assigned_pos <- sum(!is.na(taxonomy_out[missing_species[i],]))
+    deepest_assigned <- taxonomy_out[missing_species[i],deepest_assigned_pos]
+    missing_tax_lev <- is.na(taxonomy_out[missing_species[i],])
+    if(grepl("Unassigned", deepest_assigned)){
+      taxonomy_out[missing_species[i],missing_tax_lev] <- deepest_assigned
+    }else{
+      taxonomy_out[missing_species[i],missing_tax_lev] <- paste0(deepest_assigned, "_unclassified")
+    }
+  }
+  taxonomy_out
+}
+
+#NOTE: Fix the problem with the arguments 'neg_ctrl' and 'ctrl'. They can't be read by sample_subsets. Probable problem with lexical scoping. 
+#NOTE2: The function was changed to adapt it to the metadata of this particular data set. This should be fixed so that the function can be generilized.
+decontam_prev_analysis = function(
+  OTU_table,
+  decontam_thres = 0.5,
+  neg_ctrl = "Plasma_ext_blank",
+  sample = "Plasma",
+  bch = NULL
+){
+  # Add the "is.neg" factor to the metadata of the new phyloseq object.
+  #print(neg_ctrl)
+  #print(sample)
+  sample_data(OTU_table)$is.neg <- sample_data(OTU_table)$sample_type2 == "DENC"
+
+  #print(decontam_thres)
+  #print("decontam_thres" %in% ls(environment(isContaminant)))
+  decontam_output <- isContaminant(OTU_table, method="prevalence", neg="is.neg", threshold = decontam_thres, batch = bch)
+  decontam_output.no_na <- decontam_output[!is.na(decontam_output$p),]
+
+  # Subset phyloseq object to those OTUs that had a decontam p-value, which are those with a prevalence across all samples above 1.
+  OTU_table_pick <- prune_taxa(!is.na(decontam_output$p), OTU_table)
+
+  # Make phyloseq object of presence-absence in negative controls
+  OTU_table_pick.neg <- subset_samples(OTU_table_pick, sample_type2 == "DENC")
+  OTU_table_pick.neg.presence <- transform_sample_counts(OTU_table_pick.neg, function(abund) 1*(abund>0))
+  # Make phyloseq object of rel-abund in negative controls
+  OTU_table_pick.neg.ra <- transform_sample_counts(OTU_table_pick.neg, function(x) x/sum(x))
+  # Get the average OTU rel-abund across negative controls
+  blank_average_freq <- taxa_sums(OTU_table_pick.neg.ra)/nsamples(OTU_table_pick.neg.ra)
+
+  # Make phyloseq object of presence-absence in true positive samples
+  OTU_table_pick.pos <- subset_samples(OTU_table_pick, sample_type2 == "Plasma")
+  OTU_table_pick.pos.presence <- transform_sample_counts(OTU_table_pick.pos, function(abund) 1*(abund>0))
+  # Make phyloseq object of rel-abund in true positive samples
+  OTU_table_pick.pos.ra <- transform_sample_counts(OTU_table_pick.pos, function(x) x/sum(x))
+  # Get the average OTU rel-abund across true positive samples
+  plasma_average_freq <- taxa_sums(OTU_table_pick.pos.ra)/nsamples(OTU_table_pick.pos.ra)
+  # Make data.frame of prevalence in positive and negative samples
+  prev_per_OTU <- data.frame(prevalence.plasma=taxa_sums(OTU_table_pick.pos.presence), prevalence.blank=taxa_sums(OTU_table_pick.neg.presence), contam.prev=decontam_output.no_na$contaminant, ave.freq.plasma=plasma_average_freq, ave.freq.blank=blank_average_freq)
+
+  return(list(decontam_output = decontam_output.no_na, prev_per_OTU = prev_per_OTU, OTU_table_pick = OTU_table_pick))
+}
+
+decontam_summary_OTUs = function(
+  OTU_table,
+  prev_per_OTU
+){
+  table <- data.frame(total_OTUs = ntaxa(OTU_table), 
+                      real_OTUs = sum(prev_per_OTU$contam.prev ==  FALSE), 
+                      perc_real_OTUs = round(100 *(sum(prev_per_OTU$contam.prev ==  FALSE)/ntaxa(OTU_table))),
+                      real_OTUs_not_in_blanks = sum(prev_per_OTU$contam.prev ==  FALSE & prev_per_OTU$prevalence.blank == 0),
+                      perc_real_OTUs_not_in_blanks = round(100*(sum(prev_per_OTU$contam.prev ==  FALSE & prev_per_OTU$prevalence.blank == 0)/ntaxa(OTU_table))),
+                      real_OTUs_not_in_blanks_high_abund = sum(prev_per_OTU$contam.prev ==  FALSE & prev_per_OTU$prevalence.blank == 0 & prev_per_OTU$ave.freq.plasma > 0.01),
+                      perc_real_OTUs_not_in_blanks_high_abund = round(100*(sum(prev_per_OTU$contam.prev ==  FALSE & prev_per_OTU$prevalence.blank == 0 & prev_per_OTU$ave.freq.plasma > 0.01)/ntaxa(OTU_table))) 
+  )
+}
+
+decontam_summary_seqs = function(
+  OTU_table,
+  OTU_table_real_OTUs,
+  OTU_table_real_OTUs_not_in_blanks,
+  OTU_table_real_OTUs_not_in_blanks_high_abund
+){
+  table <- data.frame(total_seqs = sum(sample_sums(OTU_table)), 
+                      real_seqs = sum(sample_sums(OTU_table_real_OTUs)), 
+                      perc_real_seqs = round(100 *(sum(sample_sums(OTU_table_real_OTUs))/sum(sample_sums(OTU_table)))),
+                      real_seqs_not_in_blanks = sum(sample_sums(OTU_table_real_OTUs_not_in_blanks)),
+                      perc_real_seqs_not_in_blanks = round(100*(sum(sample_sums(OTU_table_real_OTUs_not_in_blanks))/sum(sample_sums(OTU_table)))),
+                      real_seqs_not_in_blanks_high_abund = sum(sample_sums(OTU_table_real_OTUs_not_in_blanks_high_abund)),
+                      perc_real_seqs_not_in_blanks_high_abund = round(100*( sum(sample_sums(OTU_table_real_OTUs_not_in_blanks_high_abund))/sum(sample_sums(OTU_table)))) 
+  )
+}
+
+decontam_summary_per_OTU = function(
+  OTU_table,
+  OTU_table_real_OTUs,
+  OTU_table_real_OTUs_not_in_blanks,
+  OTU_table_real_OTUs_not_in_blanks_high_abund
+){
+  OTU_table.pa <- transform_sample_counts(OTU_table, function(abund) 1*(abund>0))
+  OTU_table_real_OTUs.pa <- transform_sample_counts(OTU_table_real_OTUs, function(abund) 1*(abund>0))
+  OTU_table_real_OTUs_not_in_blanks.pa <- transform_sample_counts(OTU_table_real_OTUs_not_in_blanks, function(abund) 1*(abund>0))
+  OTU_table_real_OTUs_not_in_blanks_high_abund.pa <- transform_sample_counts(OTU_table_real_OTUs_not_in_blanks_high_abund, function(abund) 1*(abund>0))
+  table <- data.frame(total_OTUs = sample_sums(OTU_table.pa), 
+                      real_OTUs = sample_sums(OTU_table_real_OTUs.pa), 
+                      perc = round(100*(sample_sums(OTU_table_real_OTUs.pa)/sample_sums(OTU_table.pa))),
+                      real_OTUs_not_in_blanks = sample_sums(OTU_table_real_OTUs_not_in_blanks.pa),
+                      perc = round(100*(sample_sums(OTU_table_real_OTUs_not_in_blanks.pa)/sample_sums(OTU_table.pa))),
+                      real_OTUs_not_in_blanks_high_abund = sample_sums(OTU_table_real_OTUs_not_in_blanks_high_abund.pa),
+                      perc = round(100*(sample_sums(OTU_table_real_OTUs_not_in_blanks_high_abund.pa)/sample_sums(OTU_table.pa)))
+  )
+  
+}
+
+# Alexandra's color palette
+ARS_PerCol20 = c("#FF0000",  "#FF7200", "#FFAA00", "#FFDD00", "#72d813", "#154f0d", "#06993E", "#06D8C3", "#06B2D8", "#004ECC", "#0300cc", "#6200CC", "#8E00CC", "#C500CC", "#CC0073", "#CC002C", "#BA8857", "#A04620", "#F47A00", "#381C00")
+ARS_PerCol35 = c("#FF0000",  "#FF7200", "#FFAA00", "#FFDD00", "#72d813", "#154f0d", "#06993E", "#06D8C3", "#06B2D8", "#004ECC", "#0300cc", "#6200CC", "#8E00CC", "#C500CC", "#CC0073", "#CC002C", "#BA8857", "#A04620", "#F47A00", "#771155","#AA4488", "#CC99BB", "#114477", "#4477AA", "#77AADD", "#381C00", "#781156","#A51876","#D21E96","#E43FAD", "#117845","#18A55E","#1ED278","#3FE491","#6CEAAB")
+```
+
+```{r load_data, echo=FALSE}
+setwd("~/Documents/work/bioinformatics/experiments/16S_rRNA_gene/GB_revision1/R scripts for Github/Group 3/decontamination/")
+#Load data
+load("~/Documents/work/bioinformatics/experiments/16S_rRNA_gene/GB_revision1/R scripts for Github/Group 3/div_analysis/Group3.div_analysis.v2.GB1.OTU_tables.Rdata")
+```
+
+```{r include=FALSE}
+#Subset "master OTU-table" to plasma samples only
+OTU_table2_bs_sor_pl <- subset_samples(OTU_table2_bs_sor, sample_type2 == "Plasma")
+OTU_table2_bs_sor_pl <- prune_taxa(taxa_sums(OTU_table2_bs_sor_pl) > 0, OTU_table2_bs_sor_pl)
+
+# Get plasma OTUs that fall into the low-abundance category (below 0.1%) 
+sum(taxa_sums(OTU_table2_bs_sor_pl))*0.001 # OTU abundance max-threshold in absolute numbers
+OTU_table2_bs_sor_pl_low <- OTU_table2_bs_sor_pl
+df = abund.range.filter(otu_table(OTU_table2_bs_sor_pl), min_percent = 0, max_percent = 0.1)
+otu_table(OTU_table2_bs_sor_pl_low) <- otu_table(df$data.filter)
+ntaxa(OTU_table2_bs_sor_pl_low)  # Number of OTUs in the "low abund category"
+(ntaxa(OTU_table2_bs_sor_pl_low) / ntaxa(OTU_table2_bs_sor_pl)) * 100 
+
+# Get plasma OTUs that fall into the medium-abundance category (0.1% - 1%) 
+sum(taxa_sums(OTU_table2_bs_sor_pl))*0.01 # OTU abundance max-threshold in absolute numbers
+OTU_table2_bs_sor_pl_med <- OTU_table2_bs_sor_pl
+df = abund.range.filter(otu_table(OTU_table2_bs_sor_pl), min_percent = 0.1, max_percent = 1.0)
+otu_table(OTU_table2_bs_sor_pl_med) <- otu_table(df$data.filter)
+ntaxa(OTU_table2_bs_sor_pl_med)  # Number of OTUs in the "medium abund category"
+(ntaxa(OTU_table2_bs_sor_pl_med) / ntaxa(OTU_table2_bs_sor_pl)) * 100 
+
+# Get plasma OTUs that fall into the high-abundance category (> 1%) 
+sum(taxa_sums(OTU_table2_bs_sor_pl))*0.1 # OTU abundance max-threshold in absolute numbers
+OTU_table2_bs_sor_pl_high <- OTU_table2_bs_sor_pl
+df = abund.range.filter(otu_table(OTU_table2_bs_sor_pl), min_percent = 1.0)
+otu_table(OTU_table2_bs_sor_pl_high) <- otu_table(df$data.filter)
+ntaxa(OTU_table2_bs_sor_pl_high)  # Number of OTUs in the "high abund category"
+(ntaxa(OTU_table2_bs_sor_pl_high) / ntaxa(OTU_table2_bs_sor_pl)) * 100 
+```
+
+#Criterion (i): batch effects
+
+## DA analysis by DNA extraction batch
+
+```{r DA_ext_batch, echo=FALSE, message=FALSE, warning=FALSE, results="hide"}
+Dummy <- OTU_table2_bs_sor_pl
+DA_data <- as.data.frame(otu_table(Dummy))
+# Metadata
+Dummy_metadata <- data.frame(sample_data(Dummy))
+# Create new combined factor (BD = Batch-Date)
+#Dummy_metadata$BD <- factor(paste(Dummy_metadata$plasma_ext_batch, Dummy_metadata$ext_date, sep="."))
+
+# Create "reapeted mesurment factor" for blocking data
+Dummy_metadata$repeat_meas <- as.character(Dummy_metadata$patient_id)
+Dummy_metadata$repeat_meas[is.na(Dummy_metadata$repeat_meas)] <- as.character(Dummy_metadata$biological_sample[is.na(Dummy_metadata$repeat_meas)])
+Dummy_metadata$repeat_meas <- as.factor(Dummy_metadata$repeat_meas)
+
+#Model design
+design <- model.matrix(~0 + ext_id, data=Dummy_metadata)
+dge <- DGEList(DA_data, group = Dummy_metadata$ext_id)
+
+cont <- makeContrasts(F_G = (ext_idF_EXP1 + ext_idF_EXP2 + ext_idF_EXP3)/3 - (ext_idG_EXP1 + ext_idG_EXP2 + ext_idG_EXP3)/3, levels=design)
+
+cont_label="A_B"
+fact <- "plasma_ext_batch"
+DA_plots_file_name = "./DA_plots/DA_by_DNA_ext_batch.pdf"
+```
+
+```{r DA_test, echo=FALSE, message=FALSE, warning=FALSE, results="show"}
+dgeTMM <- edgeR::calcNormFactors(dge, method = "TMM")
+v_OTU <- voom(dgeTMM, design = design, plot = FALSE)
+##MAIN CHANGES INTRODUCED BY GORDON
+PoissonFit <- glmFit(dgeTMM,design,dispersion=0,prior.count=0)
+StructuralZero <- (PoissonFit$fitted.values < 1e-8 & dgeTMM$counts < 1e-8)
+
+v_OTU_NA <- v_OTU
+v_OTU_NA$E[StructuralZero] <- NA
+
+corfit_NA <- duplicateCorrelation(v_OTU_NA, design, block = Dummy_metadata$repeat_meas)
+fit_NA <- lmFit(v_OTU_NA, design = design, block = Dummy_metadata$repeat_meas, correlation = corfit_NA$consensus.correlation)
+fit <- lmFit(v_OTU, design = design, block = Dummy_metadata$repeat_meas, correlation = corfit_NA$consensus.correlation)
+
+fit$sigma <- fit_NA$sigma
+fit$df.residual <- fit_NA$df.residual
+fit$Amean <- fit_NA$Amean
+
+fit <- contrasts.fit(fit, contrasts = cont)
+fit <- eBayes(fit, robust=FALSE) 
+DT<- decideTests(fit)
+summary(DT)
+```
+
+```{r DA_kit_batch_results, include=FALSE}
+DT.df <- as.data.frame(DT)
+#Create data frame that contains which OTUs met the contamination filtering criteria
+contam_filters_results <- data.frame(ext_batch = rep(NA, nrow(DT.df)), ext_date = rep(NA, nrow(DT.df)), 
+                                     decontam_batchF = rep(NA, nrow(DT.df)), decontam_strict_batchF = rep(NA, nrow(DT.df)), 
+                                     decontam_batchG = rep(NA, nrow(DT.df)), decontam_strict_batchG = rep(NA, nrow(DT.df)), 
+                                     decontam_all_batches = rep(NA, nrow(DT.df)), decontam_strict_all_batches = rep(NA, nrow(DT.df)), 
+                                     sample_association = rep(NA, nrow(DT.df)), 
+                                     row.names = rownames(DT.df))
+
+# Logical vector indicating the OTUs that where significant (adj.p.value < 0.05) in at least one of the contrasts
+sig.OTUs.logical <- apply(DT.df, 1, function(x) any(x != 0)) 
+# Assign a N to OTUs that didn't meet the criteria and a Y to those that did
+contam_filters_results[sig.OTUs.logical, "ext_batch"] <- "N"
+contam_filters_results[!sig.OTUs.logical, "ext_batch"] <- "Y"
+```
+
+##DA analysis by DNA extraction date within batches
+
+```{r DA_ext_date, echo=FALSE, results="hide", message=TRUE}
+Dummy <- OTU_table2_bs_sor_pl
+DA_data <- as.data.frame(otu_table(Dummy))
+# Metadata
+Dummy_metadata <- data.frame(sample_data(Dummy))
+
+# Create "reapeted mesurment factor" for blocking data
+Dummy_metadata$repeat_meas <- as.character(Dummy_metadata$patient_id)
+Dummy_metadata$repeat_meas[is.na(Dummy_metadata$repeat_meas)] <- as.character(Dummy_metadata$biological_sample[is.na(Dummy_metadata$repeat_meas)])
+Dummy_metadata$repeat_meas <- as.factor(Dummy_metadata$repeat_meas)
+
+#Model design
+design <- model.matrix(~0 + ext_id, data=Dummy_metadata)
+dge <- DGEList(DA_data, group= Dummy_metadata$ext_id)
+
+cont <- makeContrasts(F1  = ext_idF_EXP1 - ext_idF_EXP2, F2  = ext_idF_EXP1 - ext_idF_EXP3, F3  = ext_idF_EXP2 - ext_idF_EXP3, G1  = ext_idG_EXP1 - ext_idG_EXP2, G2  = ext_idG_EXP1 - ext_idG_EXP3, G3  = ext_idG_EXP2 - ext_idG_EXP3, levels=design)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, ref.label='DA_test', results="show"}
+```
+
+```{r DA_ext_date_results, echo=FALSE, message=FALSE, warning=FALSE, results="show"}
+DT.df <- as.data.frame(DT)
+# Logical vector indicating the OTUs that where significant (adj.p.value < 0.05) in at least one of the contrasts
+sig.OTUs.logical <- apply(DT.df, 1, function(x) any(x != 0) ) 
+# Assign a N to OTUs that didn't meet the criteria and a Y to those that did
+contam_filters_results[sig.OTUs.logical, "ext_date"] <- "N"
+contam_filters_results[!sig.OTUs.logical, "ext_date"] <- "Y"
+```
+
+##Summary of batch effect analysis results 
+
+Number of ASVs in all plasma samples: `r nrow(contam_filters_results)`
+
+Number of ASVs without a batch effect by DNA-extraction-batch: `r sum(contam_filters_results$ext_batch == "Y")`
+
+Number of ASVs without a batch effect by DNA-extraction-run: `r sum(contam_filters_results$ext_date == "Y")`
+
+#Criterion (ii): Decontam
+
+##Decontam: batch F
+
+```{r decon_analysis_var_dec_batchA, echo=FALSE}
+# Subset OTU table to samples of batch F
+OTU_table_decontam <- subset_samples(OTU_table2_bs_sor_pl_bl, DEB == "F")
+OTU_table_decontam <- prune_taxa(taxa_sums(OTU_table_decontam) > 0, OTU_table_decontam)
+
+decontam_prev_plot_file = "Figure_S9_E_BatchF.pdf"
+```
+
+```{r decontam_analysis, echo=FALSE, message=TRUE, warning=TRUE, results="show"}
+# Inspect library sizes
+df <- as.data.frame(sample_data(OTU_table_decontam)[,"sample_type2"])
+df$LibrarySize <- sample_sums(OTU_table_decontam)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=sample_type2)) + geom_point() + ggtitle(label = "Library sizes of plasma and blank samples")
+
+# Use custom-made function that runs decontam
+decontam_results <- decontam_prev_analysis(OTU_table_decontam, decontam_thres = 0.55)
+
+# Small table with overview results
+summary_table <- decontam_summary_OTUs(OTU_table_decontam, decontam_results$prev_per_OTU)
+row.names(summary_table) <- "num_of_OTUs"
+t(summary_table)
+
+# Get the names of the "real OTUs"
+real_OTU_names <- row.names(subset(decontam_results$decontam_output, contaminant == FALSE))
+
+# Create pos vs neg samples prevalence plot (size of dots based on blank OTU frequencies in plasma)
+prevalence_plot <- ggplot(data=decontam_results$prev_per_OTU, aes(x=prevalence.blank, y=prevalence.plasma, color=contam.prev, size=ave.freq.plasma)) + geom_jitter() + scale_color_discrete(labels=c("Real","Contaminant")) + labs(size="Plasma abundance") + labs(color="Decontam classification") + xlab("Prevalence in DENC")  + ylab("Prevalence in plasma") 
+prevalence_plot + scale_size_area(max_size=10) + scale_x_continuous(breaks = pretty) + scale_y_continuous(breaks = pretty) + theme(axis.text = element_text(size=12, face="bold"), axis.title = element_text(size=14, face="bold"), legend.title = element_text(size=14, face="bold"), legend.text = element_text(size=12))
+ggsave(decontam_prev_plot_file, width = 9, height = 6)
+
+# Logical vector indicating the OTUs of table contam_filters_results that passed the decontam filter in batch B
+decontam_real_OTUs.logical <- rownames(contam_filters_results) %in% real_OTU_names
+# Filling decontam results in contam_filters_results table
+column <- paste("decontam_batch", levels(get_variable(OTU_table_decontam, "DEB")), sep = "")
+contam_filters_results[decontam_real_OTUs.logical, column] <- "Y"
+contam_filters_results[!decontam_real_OTUs.logical, column] <- "N"
+# Filling decontam "strict" results in contam_filters_results table
+real_OTU_names_not_in_blanks <- row.names(subset(decontam_results$prev_per_OTU, prevalence.blank == 0 & contam.prev == FALSE))
+decontam_real_OTUs_not_in_blanks.logical <- rownames(contam_filters_results) %in% real_OTU_names_not_in_blanks
+column <- paste("decontam_strict_batch", levels(get_variable(OTU_table_decontam, "DEB")), sep = "")
+contam_filters_results[decontam_real_OTUs_not_in_blanks.logical, column] <- "Y"
+contam_filters_results[!decontam_real_OTUs_not_in_blanks.logical, column] <- "N"
+```
+
+```{r echo=FALSE}
+#Save decontam results for current batch
+decontam_results_F <- decontam_results
+```
+
+##Decontam: batch G
+
+```{r decon_analysis_var_dec_batchG, echo=FALSE}
+# Subset OTU table to samples of batch G
+OTU_table_decontam <- subset_samples(OTU_table2_bs_sor_pl_bl, DEB == "G")
+OTU_table_decontam <- prune_taxa(taxa_sums(OTU_table_decontam) > 0, OTU_table_decontam)
+
+decontam_prev_plot_file = "Figure_S9_E_BatchG.pdf"
+```
+
+```{r ref.label='decontam_analysis', echo=FALSE}
+```
+
+```{r echo=FALSE}
+#Save decontam results for current batch
+decontam_results_G <- decontam_results
+```
+
+##Decontam: all batches
+
+```{r decon_analysis_var_dec_allbatches, echo=FALSE}
+OTU_table_decontam <- OTU_table2_bs_sor_pl_bl
+```
+
+```{r decontam_analysis_all_batches, echo=FALSE, message=TRUE, warning=TRUE, results="show"}
+# Inspect library sizes
+df <- as.data.frame(sample_data(OTU_table_decontam)[,"sample_type2"])
+df$LibrarySize <- sample_sums(OTU_table_decontam)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=sample_type2)) + geom_point() + ggtitle(label = "Library sizes of plasma and blank samples")
+
+# Use custom-made function that runs decontam
+decontam_results <- decontam_prev_analysis(OTU_table_decontam, decontam_thres = 0.55, bch = "DEB")
+
+# Small table with overview results
+summary_table <- decontam_summary_OTUs(OTU_table_decontam, decontam_results$prev_per_OTU)
+row.names(summary_table) <- "num_of_OTUs"
+t(summary_table)
+
+# Get the names of the "real OTUs"
+real_OTU_names <- row.names(subset(decontam_results$decontam_output, contaminant == FALSE))
+
+# Logical vector indicating the OTUs of table contam_filters_results that passed the decontam filter in batch B
+decontam_real_OTUs.logical <- rownames(contam_filters_results) %in% real_OTU_names
+# Filling decontam results in contam_filters_results table
+contam_filters_results[decontam_real_OTUs.logical, "decontam_all_batches"] <- "Y"
+contam_filters_results[!decontam_real_OTUs.logical, "decontam_all_batches"] <- "N" 
+# Filling decontam "strict" results in contam_filters_results table
+real_OTU_names_not_in_blanks <- row.names(subset(decontam_results$prev_per_OTU, prevalence.blank == 0 & contam.prev == FALSE))
+decontam_real_OTUs_not_in_blanks.logical <- rownames(contam_filters_results) %in% real_OTU_names_not_in_blanks
+
+contam_filters_results[decontam_real_OTUs_not_in_blanks.logical, "decontam_strict_all_batches"] <- "Y"
+contam_filters_results[!decontam_real_OTUs_not_in_blanks.logical, "decontam_strict_all_batches"] <- "N"
+```
+
+```{r echo=FALSE}
+#Save decontam results for current batch
+decontam_results_all_batches <- decontam_results
+```
+
+#Criterion (iii): sample association
+
+```{r spearman, echo=FALSE, message=FALSE, warning=FALSE, results="show", fig.width=9, fig.height=28}
+# Normalize OTUs by rarefying at the minimum sample size.
+OTU_table2_bs_sor_pl_rf <- rarefy_even_depth(OTU_table2_bs_sor_pl, rngseed = 711, replace=FALSE, trimOTUs = TRUE) # Rarify OTU table to the minimum sample size.
+
+# Generate OTU table with plasma samples of DNA extraction A
+OTU_table2_bs_sor_pl_rf_A <- subset_samples(OTU_table2_bs_sor_pl_rf, DEB == "F")
+OTU_table2_bs_sor_pl_rf_A.df <- otu_table(OTU_table2_bs_sor_pl_rf_A) # Extract OTU table from phylose object
+OTU_table2_bs_sor_pl_rf_A.df.PA <- transform_sample_counts(OTU_table2_bs_sor_pl_rf_A.df, function(abund) 1*(abund>0)) # Transform extracted OTU table into presence/absence
+# Generate OTU table with plasma samples of DNA extraction B
+OTU_table2_bs_sor_pl_rf_B <- subset_samples(OTU_table2_bs_sor_pl_rf, DEB == "G")
+OTU_table2_bs_sor_pl_rf_B.df <- otu_table(OTU_table2_bs_sor_pl_rf_B) # Extract OTU table from phylose object
+OTU_table2_bs_sor_pl_rf_B.df.PA <- transform_sample_counts(OTU_table2_bs_sor_pl_rf_B.df, function(abund) 1*(abund>0)) # Transform extracted OTU table into presence/absence
+```
+
+ASVs that passed citerion (iii): sample association
+
+```{r kappa, echo=FALSE, message=FALSE, warning=FALSE, results="show"}
+
+#Calculate the kappa-statistic for all OTUs shared between DNA extraction batches (the same OTUs as for the Spearman correlation). Save the results in a data frame.
+kappa_results <- data.frame(value = numeric(), statistic = numeric(), p.value = numeric())
+for(i in 1:nrow(OTU_table2_bs_sor_pl_rf_A.df.PA)){
+  k <- kappa2(t(rbind(OTU_table2_bs_sor_pl_rf_A.df.PA[i,], OTU_table2_bs_sor_pl_rf_B.df.PA[i,])), "unweighted")
+  kappa_results[i,"value"] <- k$value
+  kappa_results[i,"statistic"] <- k$statistic
+  kappa_results[i,"p.value"] <- k$p.value
+}
+row.names(kappa_results) <- taxa_names(OTU_table2_bs_sor_pl_rf_A.df.PA)
+
+kappa_results.no_NA <- subset(kappa_results, !is.na(value) & !is.na(p.value))
+kappa_results_sig <- subset(kappa_results.no_NA, p.value < 0.05)
+kappa_results_good <- subset(kappa_results.no_NA, p.value < 0.05 & value > 0.4)
+kappa_results_good <- cbind(tax_table(OTU_table2_bs_sor_pl_rf)[row.names(kappa_results_good), "Genus"], kappa_results_good)
+kappa_results_good[order(kappa_results_good$value, decreasing = TRUE),]
+kappa_results_bad <- subset(kappa_results.no_NA, p.value >= 0.05 | value <= 0.4)
+
+good_kappa_OTUs.logical <- rownames(contam_filters_results) %in% rownames(kappa_results_good)
+contam_filters_results[good_kappa_OTUs.logical, "sample_association"] <- "Y" 
+bad_kappa_OTUs.logical <- rownames(contam_filters_results) %in% rownames(kappa_results_bad)
+contam_filters_results[bad_kappa_OTUs.logical, "sample_association"] <- "N" 
+```
+
+#Results summary
+
+```{r decontamination_results_summary, echo=FALSE, message=FALSE, warning=FALSE}
+#Create character vector that indicates the abundance level of each OTU of the contam_filters_results table
+OTU_abund_level <- character(nrow(contam_filters_results))
+OTU_abund_level[rownames(contam_filters_results) %in% taxa_names(OTU_table2_bs_sor_pl_low)] <- "L"
+OTU_abund_level[rownames(contam_filters_results) %in% taxa_names(OTU_table2_bs_sor_pl_med)] <- "M"
+OTU_abund_level[rownames(contam_filters_results) %in% taxa_names(OTU_table2_bs_sor_pl_high)] <- "H"
+#Add taxa info and abundance level to contam_filters_results
+contam_filters_results <- cbind(tax_table(OTU_table2_bs_sor_pl)[,"Genus"], OTU_abund_level = OTU_abund_level, contam_filters_results)
+
+#############################################
+### RESULTS SUMMARY TABLE FOR ALL BATCHES ### 
+#############################################
+
+#Create list of decontamination criteria and combinations to calculate number of OTUs that passed them
+all_batch_effects <- c("ext_batch", "ext_date")
+criteria <- list("ext_batch", ext_run = "ext_date", all_batch_effects = all_batch_effects, "decontam_batchF", "decontam_batchG", decontam_across_DEBs = "decontam_all_batches", all_batch_effects_decontam_across_batches = c(all_batch_effects, "decontam_all_batches"), "sample_association", complete_decon_strategy = c(all_batch_effects, "decontam_all_batches","sample_association"))
+
+names(criteria)[names(criteria) == ""] <- as.character(criteria[names(criteria) == ""])
+
+#For-loop that goes through each one of the list of criteria (and combinations) defined above and count the number of OTU that passed them by reading the contam_figh blters_results table.
+criteria_counts <- numeric()
+for(i in seq_along(criteria)){
+  criteria_counts[i] <- sum(apply(subset(contam_filters_results, select = criteria[[i]]), 1, function(x){all(x == "Y")}), na.rm = TRUE)
+}
+names(criteria_counts) <- names(criteria)
+criteria_counts <- c(total = nrow(contam_filters_results), criteria_counts)
+
+#Create new table with the number of OTUs that passed each one of the criteria and different combinations of them
+contam_filt_results_sum <- data.frame(all_OTUs=criteria_counts, perc_of_total = round(100*criteria_counts/criteria_counts[1], digits = 2))
+
+#CALCULATIONS FOR LOW-ABUND OTUs
+contam_filters_results_L <- subset(contam_filters_results, OTU_abund_level == "L")
+#For-loop that goes through each one of the list of criteria (and combinations) defined above and count the number of OTU that passed them by reading the contam_filters_results table.
+criteria_counts <- numeric()
+for(i in seq_along(criteria)){
+  criteria_counts[i] <- sum(apply(subset(contam_filters_results_L, select = criteria[[i]]), 1, function(x){all(x == "Y")}), na.rm = TRUE)
+}
+names(criteria_counts) <- names(criteria)
+criteria_counts <- c(total = nrow(contam_filters_results_L), criteria_counts)
+
+contam_filt_results_sum_L <- cbind(low_abund_OTUs = criteria_counts, perc_of_total = round(100*criteria_counts/criteria_counts[1], digits = 2))
+
+#CALCULATIONS FOR MED-ABUND OTUs
+contam_filters_results_M <- subset(contam_filters_results, OTU_abund_level == "M")
+#For-loop that goes through each one of the list of criteria (and combinations) defined above and count the number of OTU that passed them by reading the contam_filters_results table.
+criteria_counts <- numeric()
+for(i in seq_along(criteria)){
+  criteria_counts[i] <- sum(apply(subset(contam_filters_results_M, select = criteria[[i]]), 1, function(x){all(x == "Y")}), na.rm = TRUE)
+}
+names(criteria_counts) <- names(criteria)
+criteria_counts <- c(total = nrow(contam_filters_results_M), criteria_counts)
+
+contam_filt_results_sum_M <- cbind(med_abund_OTUs = criteria_counts, perc_of_total = round(100*criteria_counts/criteria_counts[1], digits = 2))
+
+#CALCULATIONS FOR HIGH-ABUND OTUs
+contam_filters_results_H <- subset(contam_filters_results, OTU_abund_level == "H")
+#For-loop that goes through each one of the list of criteria (and combinations) defined above and count the number of OTU that passed them by reading the contam_filters_results table.
+criteria_counts <- numeric()
+for(i in seq_along(criteria)){
+  criteria_counts[i] <- sum(apply(subset(contam_filters_results_H, select = criteria[[i]]), 1, function(x){all(x == "Y")}), na.rm = TRUE)
+}
+names(criteria_counts) <- names(criteria)
+criteria_counts <- c(total = nrow(contam_filters_results_H), criteria_counts)
+
+contam_filt_results_sum_H <- cbind(high_abund_OTUs = criteria_counts, perc_of_total = round(100*criteria_counts/criteria_counts[1], digits = 2))
+
+contam_filt_results_sum <- cbind(contam_filt_results_sum, contam_filt_results_sum_L, contam_filt_results_sum_M, contam_filt_results_sum_H)
+
+write.table(contam_filt_results_sum, file = "contam_filt_results_all_batches.txt", quote = FALSE, sep = "\t")
+kable(contam_filt_results_sum, caption = "Contamination filters results for DEBs F & G (Data shown in Table S6)")
+```
+
+#OTUs that passed the complete bioinformatics decontamination strategy
+
+```{r include=FALSE}
+#### OTUs that passed all criteria 
+contam_filters_results_pick <- subset(contam_filters_results, ext_batch == "Y" & ext_date == "Y" & decontam_all_batches == "Y" & sample_association == "Y")
+
+OTU_names <- rownames(contam_filters_results_pick)
+OTU_table2_bs_sor_pl_bl_ra <- transform_sample_counts(OTU_table2_bs_sor_pl_bl, function(x) 100 * x/sum(x))
+Dummy_plot <- prune_taxa(OTU_names, OTU_table2_bs_sor_pl_bl_ra)
+write.table(contam_filters_results_pick, file = "OTUs_all_criteria.txt", quote = FALSE, sep = "\t")
+#writeXStringSet(refseq(Dummy_plot), "./Picked_OTUs/OTUs_crit_1-3.fasta", format = "fasta")
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#I changed the DENC color to a slightly lighter one.
+Col5 <- c("red", "#F7B0B0")
+
+#Factor created to have the desired arrangement in x-axis
+sample_data(Dummy_plot)$plot_fact <- factor(paste(sample_data(Dummy_plot)$DEB, sample_data(Dummy_plot)$sample_type2, sample_data(Dummy_plot)$biological_sample, sep="."))
+
+vline <- cumsum(as.numeric(table(sample_data(Dummy_plot)$DEB))) + 0.5
+x <- sort(sample_data(Dummy_plot)$plot_fact)
+y <- grepl("DENC",x)
+z <- c(y[2:length(y)], NA)
+c <- y==T&z==F
+pos <- 1:length(y)
+vline2 <- pos[c] + 0.5
+
+# Get the number of DEBs that passed decontam for each ASV and order the picked ASV based on this.
+num_decontam_DEBs <- apply(contam_filters_results_pick[,c("decontam_batchF","decontam_batchG")], 1, function(x){
+  sum(x == "Y")
+})
+num_decontam_DEBs <- sort(num_decontam_DEBs, decreasing = T)
+OTU_names <- names(num_decontam_DEBs)
+
+#Import Silva 138 taxonomic classification
+data_path <- "~/Documents/work/bioinformatics/experiments/16S_rRNA_gene/GB_revision1/seq_run_Mar_2021/data/"
+tax_silva_138 <- read.table(paste0(data_path, "Mar21_rep_seqs_dada2_silva_138_99_515_806_tax.tsv"), sep = "\t", row.names = 1, header = T)
+tax_silva_138_pick <- tax_silva_138[OTU_names,]
+tax_silva_138_pick_ed <- format_silva_tax(tax_silva_138_pick)
+
+tax_silva_138_pick_ed2 <- apply(tax_silva_138_pick_ed, 2, function(x){
+  str_replace_all(x, "[[:blank:]]*[[:alpha:]]__", "")
+})
+row.names(tax_silva_138_pick_ed2)<- row.names(tax_silva_138_pick_ed)
+Dummy_plot_silva_138 <- Dummy_plot
+tax_table(Dummy_plot_silva_138) <- tax_table(tax_silva_138_pick_ed2)
+
+heatmap <- plot_heatmap(Dummy_plot_silva_138, sample.order = "plot_fact", taxa.order = rev(OTU_names), sample.label = "sample_type", taxa.label = "Genus", trans = log_trans(10), low="#66CCFF", high="#000033", na.value="white")
+heatmap <- heatmap + geom_tile(colour = "black") + geom_vline(xintercept = vline, color="black", size=1) + geom_vline(xintercept = vline2, size=0.5, linetype = "dashed") + ggtitle("Figure S9F")
+heatmap
+ggsave("Figure_S9F.pdf", width = 10, height = 6)
+```
+
+##Diff. abundance: healthy vs melanoma
+
+###Diff. abund at the ASV-level
+
+**Diff. abund. of ASVs that met batch-effect and decontam filters**
+
+```{r include=FALSE}
+contam_filters_results_pick <- subset(contam_filters_results, ext_batch == "Y" & ext_date == "Y" & decontam_all_batches == "Y")
+OTU_names <- rownames(contam_filters_results_pick)
+Dummy <- prune_taxa(OTU_names, OTU_table2_bs_sor_pl)
+```
+
+> Test adjusted by DEB
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, results="hide"}
+DA_data <- as.data.frame(otu_table(Dummy))
+# Metadata
+Dummy_metadata <- data.frame(sample_data(Dummy))
+# Create new combined factor (BD = Batch-Date)
+#Dummy_metadata$BD <- factor(paste(Dummy_metadata$plasma_ext_batch, Dummy_metadata$ext_date, sep="."))
+
+# Create "reapeted mesurment factor" for blocking data
+Dummy_metadata$repeat_meas <- as.character(Dummy_metadata$patient_id)
+Dummy_metadata$repeat_meas[is.na(Dummy_metadata$repeat_meas)] <- as.character(Dummy_metadata$biological_sample[is.na(Dummy_metadata$repeat_meas)])
+Dummy_metadata$repeat_meas <- as.factor(Dummy_metadata$repeat_meas)
+
+#Model design
+design <- model.matrix(~0 + sample_type + DEB, data=Dummy_metadata)
+
+dge <- DGEList(DA_data, group = Dummy_metadata$sample_type)
+cont <- makeContrasts(ST = sample_typeHealthy - sample_typeMelanoma, levels=design)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, ref.label='DA_test', results="show"}
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+topTable(fit, "ST", p.value = 0.05)
+
+one_OTU_abund <- prune_taxa(row.names(topTable(fit, "ST", p.value = 0.05)), Dummy_plot)
+p1 <- plot_bar(one_OTU_abund, x="plot_fact", fill="sample_type2")
+ylabel <- paste(taxa_names(one_OTU_abund), "\n", as.character(tax_table(one_OTU_abund)[,"Genus"]), collapse = "")
+#Extract metadata and sort it by "plot_fact" so that it can be used for changing the x-axis tick labels by another variable
+sd <- sample_data(Dummy_plot) %>% as.matrix %>% as.data.frame
+sd_sort <- arrange(sd, plot_fact)
+p1 + geom_bar(stat="identity") + theme(axis.text.y = element_text(size=6), axis.title.y = element_text(angle=0, size = 10), axis.title.x=element_blank()) + scale_fill_manual(values=Col5[2:1], guide = FALSE) + scale_y_continuous(trans = "sqrt", labels = scales::number_format(accuracy = 0.1)) + geom_vline(xintercept = vline, color="black", size=1) + ylab(ylabel) + geom_vline(xintercept = vline2, size=0.5, linetype = "dashed") + scale_x_discrete(labels=as.character(sd_sort$sample_type)) + ggtitle("Figure 5C")
+ggsave("Figure_5C.pdf", width = 10, height = 4)
+```
+
+> Test adjusted by ext-id
+
+```{r echo=FALSE}
+#Model design
+design <- model.matrix(~0 + sample_type + ext_id, data=Dummy_metadata)
+dge <- DGEList(DA_data, group = Dummy_metadata$sample_type)
+cont <- makeContrasts(ST = sample_typeHealthy - sample_typeMelanoma, levels=design)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, ref.label='DA_test', results="show"}
+```
+
+```{r echo=FALSE}
+topTable(fit, "ST", p.value = 0.05)
+```
+
+```{r include=FALSE}
+save.image("~/Documents/work/bioinformatics/experiments/16S_rRNA_gene/GB_revision1/R scripts for Github/Group 3/decontamination/Group3.decontamination.RData")
+```
+
+
