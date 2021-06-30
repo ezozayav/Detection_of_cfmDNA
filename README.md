@@ -39,10 +39,20 @@ diseases.
 
 The main analyses of this study were performed across four R markdown scripts organized in the following way:
 
-* Group 1 and 2 samples
+* Group 1 and 2 samples (see paper Figure 1)
   + Diversity analysis
+    - Input data: Group_1_and_2.data.RData 
+    - Analysis script: Group_1_and_2.diversity_analysis.Rmd
+    - Output data: Group_1_and_2.OTU_tables.RData
   + Decontamination analysis
+    - Input data: Group_1_and_2.OTU_tables.RData
+    - Analysis script: Group_1_and_2.decontamination.Rmd
 
-* Group 3 samples
+* Group 3 samples (see paper Figure 1)
   + Diversity analysis
+    - Input data: Group3.data.RData 
+    - Analysis script: Group3.div_analysis.v2.GB1.Rmd 
+    - Output data: Group3.div_analysis.v2.GB1.OTU_tables.Rdata
   + Decontamination analysis
+    - Input data: Group3.div_analysis.v2.GB1.OTU_tables.Rdata
+    - Analysis script: Group3.decontamination.Rmd
